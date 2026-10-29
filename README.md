@@ -8,7 +8,7 @@ through Comfy Router, or run the same models on your own ComfyUI or a Comfy depl
 
 **▶ Live demo: [comfy-cinematic.ai.studio](https://comfy-cinematic.ai.studio/)**
 
-**▶ Video: [X](https://x.com/Enchant62923386/status/2115742611554361424)
+**▶ Video: [X](https://x.com/Enchant62923386/status/2115742611554361424)**
 
 Sign in with your own Comfy API key (top right), make a project, and go.
 
