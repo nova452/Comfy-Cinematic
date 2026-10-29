@@ -33,6 +33,10 @@ The **Video** tab renders clips with **MiniMax H3**, either on Router or as **Mi
   <img src="docs/media/continue.png" width="40%" alt="Continue mode, in orange, extending a clip with the prompt he does a handstand">
 </p>
 
+
+- Motion reference, Object swap, clip looping and more
+<img width="1200" height="226" alt="minimax-trio-light" src="https://github.com/user-attachments/assets/925958ed-a5a9-4125-8a6b-d7f45a53a364" />
+
 - **Video Reference + character sheets.** Drop in a reference clip, add a character sheet, and say
   who to replace: *"Replace the man in the yellow shirt with the provided character."* The fight,
   the walk or the selfie keeps its moves and its camera, and the person is swapped out.
