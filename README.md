@@ -1,6 +1,6 @@
 # Comfy Cinematic
 
-![Comfy Cinematic: character sheets and reference clips in the Assets panel, and the clips made from them on the canvas](docs/media/hero-banner.png)
+![Comfy Cinematic: character sheets and reference clips in the Assets panel, and the clips made from them on the canvas](docs/media/home.png)
 
 **A project canvas for stills and clips, built on Comfy.** Open a project, describe a frame or a
 shot, and the result lands on an infinite canvas you can pan, zoom, drag, undo and share. Render
