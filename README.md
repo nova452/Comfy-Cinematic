@@ -91,6 +91,14 @@ The **Assets** tab is every upload and every render in the project in one librar
   <img src="docs/media/canvas-clips.png" width="50%" alt="Four clips on the canvas made from those references: a rooftop fight, a walk-by, a selfie and a handstand">
 </p>
 
+### Projects
+
+One canvas per idea. The home page lists your projects, each with its first render as the cover,
+a render count and when you last worked on it. **New project** takes you straight to an empty
+canvas, with nothing to set up first.
+
+![The projects home: the Comfy Cinematic header, New project, and a project card](docs/media/home.png)
+
 ### The canvas
 
 ![The full workspace: project card, Assets panel, the canvas with four clips, and the dock](docs/media/hero.png)
