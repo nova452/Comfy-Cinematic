@@ -5,6 +5,8 @@ Live at: https://comfy-cinematic.ai.studio/
 
 Demo: https://x.com/Enchant62923386/status/2115742611554361424
 
+A mobile app for all your Comfy needs, runs on the browser.
+
 Motion reference, Object swap, clip looping and more
 <img width="1200" height="226" alt="minimax-trio-light" src="https://github.com/user-attachments/assets/925958ed-a5a9-4125-8a6b-d7f45a53a364" />
 
