@@ -7,8 +7,8 @@
 
 /** Where the source lives. */
 export const GITHUB_REPO = {
-  name: "Comfy-Org/comfy-cinematic-studio",
-  url: "https://github.com/Comfy-Org/comfy-cinematic-studio",
+  name: "nova452/Comfy-Cinematic",
+  url: "https://github.com/nova452/Comfy-Cinematic",
 } as const;
 
 export const SITE_NAME = "Comfy Cinematic";
