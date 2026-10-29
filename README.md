@@ -8,6 +8,7 @@ Live at: https://comfy-cinematic.ai.studio/
 
 Demo: https://x.com/Enchant62923386/status/2115742611554361424
 
+Motion reference, Character swap, clip looping and many more
 <img width="1200" height="226" alt="minimax-trio-light" src="https://github.com/user-attachments/assets/925958ed-a5a9-4125-8a6b-d7f45a53a364" />
 
 ## Router or local, one switch
