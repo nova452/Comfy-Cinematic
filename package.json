@@ -1,11 +1,11 @@
 {
-  "name": "comfy-cinematic-studio-guide",
+  "name": "comfy-cinematic",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "next dev --hostname 127.0.0.1",
     "build": "next build",
-    "start": "next start --hostname 127.0.0.1",
+    "start": "next start",
     "test": "node --test --experimental-strip-types test/*.test.ts && tsc --noEmit"
   },
   "engines": {

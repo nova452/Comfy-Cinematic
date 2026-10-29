@@ -1,5 +1,5 @@
-import { AppRunner } from "../components/app-runner";
+import { ProjectsHome } from "../components/projects-home";
 
 export default function Page() {
-  return <AppRunner />;
+  return <ProjectsHome />;
 }
