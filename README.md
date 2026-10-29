@@ -1,3 +1,4 @@
+
 # Comfy Cinematic
 
 <img width="320" height="180" alt="image-1793248505453" src="https://github.com/user-attachments/assets/86aa9efc-bc03-497c-8d78-80ebd56f21b6" />
@@ -7,7 +8,7 @@ Live at: https://comfy-cinematic.ai.studio/
 
 Demo: https://x.com/Enchant62923386/status/2115742611554361424
 
-
+<img width="1200" height="226" alt="minimax-trio-light" src="https://github.com/user-attachments/assets/925958ed-a5a9-4125-8a6b-d7f45a53a364" />
 
 ## Router or local, one switch
 
