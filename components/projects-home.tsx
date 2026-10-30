@@ -183,8 +183,7 @@ export function ProjectsHome() {
 
       <footer className="home-footer">
         <span>
-          Projects and media live in this browser. Renders are billed to the Comfy workspace behind
-          your key.
+          Built on Comfy · FLUX 3 for stills, MiniMax H3 for clips
         </span>
         <a href={GITHUB_REPO.url} target="_blank" rel="noreferrer noopener" title="Browse the source">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true">

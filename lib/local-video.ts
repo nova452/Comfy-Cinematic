@@ -38,6 +38,7 @@ import {
 
 /** H3 renders at 24 fps. */
 import { redirectMode } from "./account.ts";
+import type { RenderProgress } from "./render-progress.ts";
 
 export const LOCAL_FPS = 24;
 /** H3 wants a few frames past the whole second, as its own graphs do. */
@@ -53,6 +54,8 @@ export type LocalVideoFiles = {
   videoVae: string;
   audioVae: string;
   steps: number;
+  /** Cap on the motion reference's short edge, or 0/undefined for the output's. */
+  refVideoEdge?: number;
 };
 
 /**
@@ -179,7 +182,25 @@ export function localFiles(config: LocalModelConfig, env: NodeJS.ProcessEnv = pr
     videoVae: env.H3_VAE_VIDEO?.trim() || DEFAULT_LOCAL_FILES.videoVae,
     audioVae: env.H3_VAE_AUDIO?.trim() || DEFAULT_LOCAL_FILES.audioVae,
     steps: config.steps,
+    refVideoEdge: config.refVideoEdge,
   };
+}
+
+/**
+ * The size a motion reference is scaled to: the render's shape, with its short
+ * edge at the cap (or the render's own short edge when there is none) — but
+ * never past the clip's own short edge, so a small clip is not upscaled into
+ * tokens it has no detail for. Video mode locks the render's ratio to the
+ * clip's, so the short edges are the whole comparison. Rounded down onto the
+ * 16-pixel grid so rounding never lands above either limit.
+ */
+export function refVideoDimensions(width: number, height: number, cap?: number, sourceEdge?: number) {
+  const short = Math.min(width, height);
+  const target = Math.min(cap || short, sourceEdge || Infinity);
+  if (target === short) return { width, height };
+  const scale = target / short;
+  const snap = (value: number) => Math.max(32, Math.floor((value * scale) / 16) * 16);
+  return { width: snap(width), height: snap(height) };
 }
 
 /** The local ComfyUI's base URL, or undefined when the app has none. */
@@ -305,12 +326,14 @@ export function buildLocalVideoGraph(
       framesOfGuide = ["302", 0];
     }
 
-    // Scale the guide to the render's own size, the way the reference workflow
-    // does with ImageResizeKJv2: encoding 720p frames for a 480p shot is most
-    // of the cost, and the model only ever attends to its own resolution.
+    // Scale the guide to the render's own size by default, the way the
+    // reference workflow does with ImageResizeKJv2. The gear's cap can bring
+    // it down (or up) to another short edge without touching the output size,
+    // and a clip smaller than either is left at its own size.
+    const guide = refVideoDimensions(width, height, files.refVideoEdge, videoShortEdge(video));
     graph["303"] = {
       class_type: "ImageScale",
-      inputs: { image: framesOfGuide, upscale_method: "lanczos", width, height, crop: "center" },
+      inputs: { image: framesOfGuide, upscale_method: "lanczos", ...guide, crop: "center" },
     };
     h3Inputs["ref_videos.ref_video_0"] = ["303", 0];
   }
@@ -403,15 +426,51 @@ export function hasAudioTrack(bytes: Uint8Array): boolean {
   return header.includes("soun") || header.includes("A_OPUS") || header.includes("A_VORBIS");
 }
 
-/** A reference data URI's bytes, without throwing on something unusable. */
-function dataUriHasAudio(uri: string) {
-  const comma = uri.indexOf(",");
-  if (comma < 0) return false;
-  try {
-    return hasAudioTrack(new Uint8Array(Buffer.from(uri.slice(comma + 1), "base64")));
-  } catch {
-    return false;
+/**
+ * An MP4's picture size, from its first track header that has one.
+ *
+ * `tkhd` stores width and height as 16.16 fixed point at the end of the box;
+ * the sound track's are zero, which is how the picture track is told apart.
+ * A rotated phone clip keeps its coded size here, which is fine for the one
+ * thing this is used for: the short edge. WebM has no `tkhd`, so it reads as
+ * unknown and the graph scales as it always has.
+ */
+export function mp4VideoSize(bytes: Uint8Array): { width: number; height: number } | undefined {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let at = 4; at + 4 <= bytes.byteLength; at++) {
+    // "tkhd"
+    if (bytes[at] !== 0x74 || bytes[at + 1] !== 0x6b || bytes[at + 2] !== 0x68 || bytes[at + 3] !== 0x64) continue;
+    const size = view.getUint32(at - 4);
+    const end = at - 4 + size;
+    if (size < 92 || end > bytes.byteLength) continue;
+    const width = view.getUint32(end - 8) / 65536;
+    const height = view.getUint32(end - 4) / 65536;
+    if (width >= 1 && height >= 1) return { width: Math.round(width), height: Math.round(height) };
   }
+  return undefined;
+}
+
+/** A reference data URI's bytes, without throwing on something unusable. */
+function dataUriBytes(uri: string) {
+  const comma = uri.indexOf(",");
+  if (comma < 0) return undefined;
+  try {
+    return new Uint8Array(Buffer.from(uri.slice(comma + 1), "base64"));
+  } catch {
+    return undefined;
+  }
+}
+
+function dataUriHasAudio(uri: string) {
+  const bytes = dataUriBytes(uri);
+  return bytes ? hasAudioTrack(bytes) : false;
+}
+
+/** The short edge of a reference clip, when its container says. */
+function videoShortEdge(uri: string) {
+  const bytes = dataUriBytes(uri);
+  const size = bytes && mp4VideoSize(bytes);
+  return size ? Math.min(size.width, size.height) : undefined;
 }
 
 /**
@@ -436,6 +495,75 @@ export function splitDataUri(
 }
 
 export type LocalVideoResult = { bytes: Uint8Array; contentType: string; requestId: string | null };
+
+/** One stage report from a running render; see `lib/render-progress.ts`. */
+export type LocalProgressUpdate = Omit<RenderProgress, "startedAt" | "updatedAt">;
+export type OnLocalProgress = (update: LocalProgressUpdate) => void;
+
+/**
+ * A v2 job record's progress, as a stage report.
+ *
+ * The deployment fills `progress` with the running node and, inside a
+ * sampler, its step; `queue_position` is set while the job waits for a GPU.
+ * Anything terminal is left to the runner, so this only ever says queued or
+ * running.
+ */
+export function progressFromJob(record: unknown): LocalProgressUpdate | undefined {
+  const status = field(record, "status");
+  if (status === "queued" || status === "pending") {
+    const position = field(record, "queue_position");
+    return { stage: "queued", ...(typeof position === "number" && position > 0 ? { queuePosition: position } : {}) };
+  }
+  if (status !== "running") return undefined;
+
+  const progress = field(record, "progress");
+  const number = (key: string) => {
+    const value = field(progress, key);
+    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  };
+  const node = field(progress, "current_node_class");
+  const step = number("step");
+  const steps = number("steps");
+  const value = number("value");
+  return {
+    stage: "running",
+    ...(step !== undefined && steps ? { step, steps } : {}),
+    ...(typeof node === "string" && node ? { node } : {}),
+    ...(value !== undefined ? { value } : {}),
+  };
+}
+
+/**
+ * Poll a v2 job's record for progress until `signal` aborts.
+ *
+ * Polling, not the SSE stream: the record is what the deployment is known to
+ * fill, and a dropped poll costs one stale label rather than the render.
+ */
+async function followJob(
+  base: string,
+  jobId: string,
+  apiKey: string | undefined,
+  onProgress: OnLocalProgress,
+  signal: AbortSignal,
+) {
+  const headers: Record<string, string> = {};
+  if (apiKey) headers.authorization = `Bearer ${apiKey}`;
+  while (!signal.aborted) {
+    try {
+      const response = await fetch(`${base}/api/v2/jobs/${encodeURIComponent(jobId)}`, {
+        headers,
+        cache: "no-store",
+        signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
+        redirect: redirectMode(),
+      });
+      const update = progressFromJob(await response.json().catch(() => undefined));
+      if (update && !signal.aborted) onProgress(update);
+    } catch {
+      // A missed poll only delays the next label.
+    }
+    await wait(2_500);
+  }
+}
 
 /**
  * Which HTTP surface an endpoint exposes.
@@ -623,8 +751,10 @@ async function runClassicVideo(
   apiKey: string | undefined,
   plan: LocalVideoPlan,
   timeoutMs: number,
+  onProgress?: OnLocalProgress,
 ): Promise<LocalVideoResult> {
   const base = endpoint.replace(/\/+$/, "");
+  if (plan.uploads.length > 0) onProgress?.({ stage: "uploading" });
   const headers: Record<string, string> = {};
   if (apiKey) headers.authorization = `Bearer ${apiKey}`;
 
@@ -669,6 +799,9 @@ async function runClassicVideo(
   if (typeof promptId !== "string" || !promptId) {
     throw new Error(classicError(submitted) ?? "ComfyUI accepted the graph but returned no prompt id.");
   }
+  // `/history` only knows a prompt once it has finished, so a bare ComfyUI
+  // reports no steps: the tile says "Rendering" until the clip is fetched.
+  onProgress?.({ stage: "running" });
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -687,6 +820,7 @@ async function runClassicVideo(
 
       const ref = classicVideoRef(field(entry, "outputs"));
       if (ref) {
+        onProgress?.({ stage: "downloading" });
         const download = await fetch(classicViewUrl(base, ref), {
           headers,
           cache: "no-store",
@@ -752,6 +886,8 @@ export async function runLocalVideo(
     timeoutMs?: number;
     /** Skip the probe when the caller already knows the surface. */
     surface?: LocalSurface;
+    /** Stage and step reports while the render runs. */
+    onProgress?: OnLocalProgress;
   } = {},
 ): Promise<LocalVideoResult> {
   const endpoint = options.baseUrl?.trim() || localEndpoint();
@@ -770,7 +906,7 @@ export async function runLocalVideo(
   // A bare ComfyUI has no /api/v2; ask once, then submit the way it expects.
   const surface = options.surface ?? (await detectLocalSurface(endpoint, options.apiKey));
   if (surface === "classic") {
-    return runClassicVideo(endpoint, options.apiKey, plan, options.timeoutMs ?? 840_000);
+    return runClassicVideo(endpoint, options.apiKey, plan, options.timeoutMs ?? 840_000, options.onProgress);
   }
 
   const client = clientFor(endpoint, options.apiKey);
@@ -782,12 +918,31 @@ export async function runLocalVideo(
     workflow.setInput(upload.nodeId, upload.field, asset);
   }
 
-  const job = await client.run(workflow, { timeoutMs: options.timeoutMs ?? 840_000 }).catch((error: unknown) => {
+  // Submit and wait apart, rather than `client.run`, so the job's id is known
+  // while it runs and its record can be followed for the tile's progress.
+  const { onProgress } = options;
+  if (plan.uploads.length > 0) onProgress?.({ stage: "uploading" });
+  const job = await client.submit(workflow).catch((error: unknown) => {
     throw localFailure(error);
   });
+  onProgress?.({ stage: "queued" });
+
+  const following = new AbortController();
+  if (onProgress) void followJob(endpoint.replace(/\/+$/, ""), job.id, options.apiKey, onProgress, following.signal);
+  try {
+    await job.wait(options.timeoutMs ?? 840_000);
+    // Terminal now; this throws the job's own failure unless it succeeded.
+    await job.result();
+  } catch (error) {
+    throw localFailure(error);
+  } finally {
+    following.abort();
+  }
+
   const [output] = job.getOutputs(LOCAL_SAVE_NODE);
   if (!output) throw new Error("The local graph produced no video output.");
 
+  onProgress?.({ stage: "downloading" });
   const bytes = await output.toBytes();
   if (bytes.byteLength === 0) throw new Error("The local render came back empty.");
 

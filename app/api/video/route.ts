@@ -27,6 +27,7 @@ import {
 } from "../../../lib/video";
 import { readLocalConfig } from "../../../lib/local-config";
 import { isBase64Value, isMediaUri } from "../../../lib/media-uri";
+import { finishProgress, isRenderId, reportProgress } from "../../../lib/render-progress";
 
 export const runtime = "nodejs";
 export const maxDuration = 900;
@@ -54,6 +55,8 @@ type VideoRequest = {
   continuationVideo?: unknown;
   enhance?: unknown;
   brain?: unknown;
+  /** The canvas tile's id, under which `/api/video/progress` reports this render. */
+  renderId?: unknown;
 };
 
 function requestIdOf(error: unknown) {
@@ -92,13 +95,18 @@ function isBase64(value: string, max: number) {
 }
 
 export async function POST(request: Request) {
+  // Filled once the body is read. The answer is also kept under that id, so a
+  // page that reloaded while this ran can still collect the clip: the render
+  // runs to the end whether or not anyone is left to read the response.
+  const progress: { id?: string } = {};
+  let response: Response;
   try {
-    return await render(request);
+    response = await render(request, progress);
   } catch (error) {
     // Anything that escapes the render's own handler is a bug, but a bare 500
     // leaves the panel with nothing to show. Report it as data instead.
     console.error("[video] unhandled failure", error);
-    return NextResponse.json(
+    response = NextResponse.json(
       {
         error: error instanceof Error ? error.message : "The video route failed.",
         code: "video_crashed",
@@ -106,14 +114,23 @@ export async function POST(request: Request) {
       { status: 500 },
     );
   }
+  if (progress.id) {
+    const body: unknown = await response.clone().json().catch(() => undefined);
+    finishProgress(progress.id, response.ok, body);
+  }
+  return response;
 }
 
-async function render(request: Request) {
+async function render(request: Request, progress: { id?: string }) {
   let body: VideoRequest;
   try {
     body = (await request.json()) as VideoRequest;
   } catch {
     return NextResponse.json({ error: "Send a JSON request." }, { status: 400 });
+  }
+  if (isRenderId(body.renderId)) {
+    progress.id = body.renderId;
+    reportProgress(progress.id, { stage: "starting" });
   }
 
   const sourcePrompt = typeof body.prompt === "string" ? body.prompt.replace(/\s+/g, " ").trim() : "";
@@ -260,6 +277,7 @@ async function render(request: Request) {
   let prompt = sourcePrompt;
   let enhanced = false;
   if (enhance && brain) {
+    reportProgress(progress.id, { stage: "rewriting" });
     try {
       const request = reference
         ? buildReferenceRequest(
@@ -330,7 +348,12 @@ async function render(request: Request) {
         },
         // A hosted deployment refuses an anonymous /api/v2/jobs, so the
         // signed-in key goes with it; a local ComfyUI only takes its own.
-        { apiKey: endpointKey(account), baseUrl: endpoint, config: localConfig },
+        {
+          apiKey: endpointKey(account),
+          baseUrl: endpoint,
+          config: localConfig,
+          onProgress: (update) => reportProgress(progress.id, update),
+        },
       );
       const src = dataUrl(rendered.bytes, rendered.contentType);
 
@@ -370,6 +393,7 @@ async function render(request: Request) {
       model.api,
     );
 
+    reportProgress(progress.id, { stage: "running" });
     const result = await runModel(apiKey, model.id, payload, { timeoutMs: 840_000 });
     if (result.kind !== "json") throw new Error("The video model returned an unexpected binary response.");
 
@@ -377,6 +401,7 @@ async function render(request: Request) {
     if (!url) throw new Error(videoResultError(result.data) ?? "The video model returned no clip.");
 
     // Router's link expires in twelve hours, so the clip is copied locally.
+    reportProgress(progress.id, { stage: "downloading" });
     const download = await downloadClip(url, apiKey);
     if (!download.ok) {
       const host = hostOf(url);

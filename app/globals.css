@@ -582,9 +582,10 @@ code {
   cursor: grabbing;
 }
 
-/* The fill. Nothing streams back from the provider, so this tracks elapsed
+/* The fill. When nothing streams back from the provider this tracks elapsed
    time rather than real progress: it eases to 92% and holds there until the
-   frame replaces the square, so it never jumps back down or claims to be done. */
+   frame replaces the square, so it never jumps back down or claims to be done.
+   A tracked render (`.is-tracked`, below) drives it from its real steps. */
 .stage-frame.is-pending::before {
   content: "";
   position: absolute;
@@ -605,6 +606,22 @@ code {
 
 .stage-frame.is-pending[data-kind="video"] {
   --pending-duration: 180s;
+}
+
+/* A render that reports its steps fills to where it really is instead. */
+.stage-frame.is-pending.is-tracked::before {
+  animation: none;
+  height: var(--pending-progress);
+  transition: height 1.2s ease-out;
+}
+
+.pending-clock {
+  position: relative;
+  z-index: 1;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
 }
 
 @keyframes pending-fill {
@@ -2811,7 +2828,8 @@ code {
   font-size: 9px;
 }
 
-.model-config .account-form input {
+.model-config .account-form input,
+.model-config .account-form select {
   height: 38px;
   padding: 0 12px;
   border-radius: 10px;
@@ -2822,9 +2840,19 @@ code {
   border: 1px solid var(--line);
 }
 
-.model-config .account-form input:focus {
+.model-config .account-form input:focus,
+.model-config .account-form select:focus {
   border-color: rgba(242, 255, 89, 0.5);
   outline: none;
+}
+
+.model-config .account-form select {
+  cursor: pointer;
+}
+
+.model-config .account-form select option {
+  background: var(--plum-lift);
+  color: var(--ink);
 }
 
 .model-config .field {
@@ -4256,6 +4284,16 @@ button.panel-row:hover:not(:disabled) {
   /* The header spans the row on phones, so the account drops under it. */
   .top-right {
     top: 78px;
+  }
+
+  /* On phones the home-page pill collapses to just the key icon so it can't overextend. */
+  .home-bar .account-credits,
+  .home-bar .account-signin {
+    display: none;
+  }
+
+  .home-bar .account-pill {
+    padding: 7px;
   }
 
   .project-name {

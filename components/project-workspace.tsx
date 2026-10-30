@@ -55,6 +55,7 @@ import {
   findVideoResolution,
   h3TierModels,
   LOCAL_MODEL_DEFAULTS,
+  REF_VIDEO_EDGES,
   localModelConfig,
   lockedByMode,
   ratioOptions,
@@ -169,6 +170,24 @@ type SaveState = "idle" | "saving" | "saved" | "error";
  */
 type PendingRender = { id: string; x: number; y: number; kind: "image" | "video"; prompt: string };
 
+/** What `/api/video/progress` says about one clip in flight. */
+type RenderTrack = { label: string; stage: string; step?: number; steps?: number; elapsed: number };
+
+/** How far up the tile's fill sits for a report, or undefined to keep the timed climb. */
+function trackFraction(track: RenderTrack | undefined) {
+  if (!track) return undefined;
+  if (track.stage === "downloading") return 0.96;
+  // Sampling is nearly all of a local clip's time, so the steps carry the bar.
+  if (track.step !== undefined && track.steps) return 0.06 + 0.88 * Math.min(1, track.step / track.steps);
+  if (track.stage === "rewriting" || track.stage === "uploading" || track.stage === "queued") return 0.03;
+  return undefined;
+}
+
+/** `m:ss` for a tile, which has room for little else. */
+function clock(seconds: number) {
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
 /**
  * A drag position waiting for the next animation frame.
  *
@@ -204,6 +223,129 @@ function releaseInFlight(projectId: string, ids: string[]) {
   const remaining = inFlightRenders.get(projectId)?.filter((slot) => !ids.includes(slot.id));
   if (remaining?.length) inFlightRenders.set(projectId, remaining);
   else inFlightRenders.delete(projectId);
+  forgetClips(ids);
+}
+
+/** Everything a clip's frame records besides what the server answers. */
+type ClipMeta = {
+  /** What the person typed; may be empty in a reference mode. */
+  value: string;
+  caption: string;
+  mode: VideoMode;
+  model: string;
+  ratio: string;
+  resolution: VideoResolution;
+  duration: number;
+  brain: string | null;
+  characterSrcs: string[];
+  backgroundSrc?: string;
+};
+
+/** A clip in flight, as written to the browser so a reload can pick it up. */
+type SavedClip = { projectId: string; slot: PendingRender; meta: ClipMeta; startedAt: number };
+
+/**
+ * Clips in flight, kept in `localStorage`.
+ *
+ * The registry above survives leaving the canvas but not a reload, and a
+ * reload also throws away the request that would have brought the clip back.
+ * The server keeps a finished clip under its tile id for a while, so writing
+ * the tile down is enough: the next load finds it and collects the clip. A
+ * still takes seconds and is not worth this; only clips are saved.
+ */
+const SAVED_CLIPS_KEY = "cinematic.inflight";
+/** Past this the server has forgotten the render anyway. */
+const SAVED_CLIP_TTL_MS = 30 * 60_000;
+
+function readSavedClips(): SavedClip[] {
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(SAVED_CLIPS_KEY) ?? "[]");
+    if (!Array.isArray(parsed)) return [];
+    const now = Date.now();
+    return (parsed as SavedClip[]).filter(
+      (clip) => clip && typeof clip.slot?.id === "string" && now - Number(clip.startedAt) < SAVED_CLIP_TTL_MS,
+    );
+  } catch {
+    return [];
+  }
+}
+
+function writeSavedClips(clips: SavedClip[]) {
+  try {
+    if (clips.length) window.localStorage.setItem(SAVED_CLIPS_KEY, JSON.stringify(clips));
+    else window.localStorage.removeItem(SAVED_CLIPS_KEY);
+  } catch {
+    // Storage is full or blocked: the clip still lands unless the page reloads.
+  }
+}
+
+function saveClip(clip: SavedClip) {
+  writeSavedClips([...readSavedClips().filter((saved) => saved.slot.id !== clip.slot.id), clip]);
+}
+
+function forgetClips(ids: string[]) {
+  const saved = readSavedClips();
+  const kept = saved.filter((clip) => !ids.includes(clip.slot.id));
+  if (kept.length !== saved.length) writeSavedClips(kept);
+}
+
+/** Saved clips being collected right now, so a remount never collects twice. */
+const resumingClips = new Set<string>();
+
+/** The frame a finished clip becomes, from the route's answer and its meta. */
+async function clipFrame(
+  id: string,
+  data: { src: string; prompt?: string; sourcePrompt?: string; enhanced?: boolean; model?: string },
+  meta: ClipMeta,
+  at: { x: number; y: number },
+): Promise<Frame> {
+  const storedSrc = await putDataUrl(data.src, "clip.mp4");
+  return {
+    id,
+    src: storedSrc,
+    prompt: data.prompt?.trim() || meta.caption,
+    // An empty prompt stays empty: the caption labels the frame, it is not
+    // something the person typed, and a reuse must not hand it back as one.
+    sourcePrompt: (data.sourcePrompt ?? meta.value).trim(),
+    enhanced: data.enhanced === true,
+    // A reference mode rewrites unconditionally, so it has no enhancer to
+    // record; leaving the field out says "not applicable" rather than
+    // "off", which would turn the button off for the user.
+    recipe: {
+      tab: "video",
+      ...(meta.mode === "free" ? { flavor: meta.brain } : {}),
+      ratio: meta.ratio,
+      resolution: meta.resolution,
+      video: {
+        model: data.model ?? meta.model,
+        mode: meta.mode,
+        ratio: meta.ratio,
+        resolution: meta.resolution,
+        duration: meta.duration,
+      },
+    },
+    characterSrcs: meta.characterSrcs,
+    backgroundSrc: meta.backgroundSrc,
+    media: "video",
+    seconds: meta.duration,
+    style: "none",
+    model: data.model ?? meta.model,
+    x: at.x,
+    y: at.y,
+    createdAt: Date.now(),
+  };
+}
+
+/** The canvas log line for a finished clip. */
+function clipMessage(meta: ClipMeta, frame: Frame): Message {
+  return {
+    id: crypto.randomUUID(),
+    role: "assistant",
+    text: meta.value
+      ? `Clip · ${videoModeLabel(meta.mode)}: ${frame.prompt}`
+      : `Clip · ${videoModeLabel(meta.mode)}`,
+    createdAt: Date.now(),
+  };
 }
 
 /** Which input asked for the asset picker. */
@@ -554,7 +696,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
   const [videoMode, setVideoMode] = useState<VideoMode>("free");
   const [localConfig, setLocalConfig] = useState<LocalModelConfig | null>(null);
   const [localConfigOpen, setLocalConfigOpen] = useState(false);
-  const [localDraft, setLocalDraft] = useState({ unet: "", clip: "", steps: "" });
+  const [localDraft, setLocalDraft] = useState({ unet: "", clip: "", steps: "", refVideoEdge: "0" });
   const [localBusy, setLocalBusy] = useState(false);
   const [localError, setLocalError] = useState<string>();
   const [verifying, setVerifying] = useState(false);
@@ -590,6 +732,8 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
   /** The same slots, readable from a callback that resolves after a render. */
   const pendingRef = useRef<PendingRender[]>([]);
   pendingRef.current = pending;
+  /** Live stage and step for clips in flight, keyed by slot id. */
+  const [tracks, setTracks] = useState<Record<string, RenderTrack>>({});
   /** False once the workspace unmounts, while its renders keep running. */
   const mountedRef = useRef(true);
   useEffect(() => {
@@ -700,11 +844,58 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     projectRef.current = project;
   }, [project]);
 
+  // A clip's request only answers at the end, so its tile asks the server how
+  // far the render has got. A 404 just means no stage yet (or already done):
+  // the tile keeps its last word rather than flickering back.
+  const clipSlots = pending.filter((slot) => slot.kind === "video").map((slot) => slot.id).join(",");
+  useEffect(() => {
+    if (!clipSlots) {
+      setTracks({});
+      return;
+    }
+    const ids = clipSlots.split(",");
+    let stopped = false;
+    const poll = async () => {
+      const results = await Promise.all(
+        ids.map(async (id) => {
+          try {
+            const response = await fetch(`/api/video/progress?id=${encodeURIComponent(id)}`, { cache: "no-store" });
+            return response.ok ? ([id, (await response.json()) as RenderTrack] as const) : undefined;
+          } catch {
+            return undefined;
+          }
+        }),
+      );
+      if (stopped) return;
+      setTracks((current) => {
+        const next: Record<string, RenderTrack> = {};
+        for (const id of ids) if (current[id]) next[id] = current[id];
+        for (const entry of results) if (entry) next[entry[0]] = entry[1];
+        return next;
+      });
+    };
+    void poll();
+    const timer = setInterval(() => void poll(), 2_500);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [clipSlots]);
+
   // Renders started before this mount keep their slots: the registry outlives
   // the component, so leaving for the grid and coming back shows what is still
   // running — and the finished frame still lands when the request returns.
+  // A reload loses the registry, but clips are also saved in the browser: any
+  // saved clip the registry does not know is one whose page went away, so its
+  // tile comes back and the finished clip is collected from the server.
   useEffect(() => {
-    setPending(inFlightRenders.get(projectId) ?? []);
+    const live = inFlightRenders.get(projectId) ?? [];
+    const orphans = readSavedClips().filter(
+      (clip) => clip.projectId === projectId && !live.some((slot) => slot.id === clip.slot.id),
+    );
+    setPending([...live, ...orphans.map((clip) => clip.slot)]);
+    for (const clip of orphans) void resumeClip(clip);
+    // resumeClip reads only refs and setters, so the project id is the only trigger.
   }, [projectId]);
 
   /**
@@ -1006,6 +1197,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       unet: current.unet,
       clip: current.clip,
       steps: String(current.steps),
+      refVideoEdge: String(current.refVideoEdge),
     });
     setVideoModelOpen(false);
     setLocalConfigOpen(true);
@@ -1062,7 +1254,12 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       return;
     }
 
-    const config = localModelConfig({ unet, clip, steps: Math.round(steps) });
+    const config = localModelConfig({
+      unet,
+      clip,
+      steps: Math.round(steps),
+      refVideoEdge: Number(localDraft.refVideoEdge),
+    });
     rememberLocalModel(config);
     setLocalConfig(config);
     setLocalConfigOpen(false);
@@ -1813,6 +2010,25 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     claimInFlight(project.id, [slot]);
 
     try {
+      // The stills are stored before the render rather than after, so a page
+      // that reloads mid-render still has them for the frame it collects.
+      // The keyframe modes ignore the character and background slots, so the
+      // frame only records what was actually sent.
+      const keyed = Boolean(firstFrame || lastFrame);
+      const meta: ClipMeta = {
+        value,
+        caption,
+        mode: videoMode,
+        model: videoModel,
+        ratio: videoRatio,
+        resolution: videoResolution,
+        duration: videoDuration,
+        brain,
+        characterSrcs: keyed ? [] : await Promise.all(characters.map((item) => putJpeg(item.base64))),
+        backgroundSrc: keyed || !background ? undefined : await putJpeg(background.base64),
+      };
+      saveClip({ projectId: project.id, slot, meta, startedAt: Date.now() });
+
       const response = await apiFetch("/api/video", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1831,6 +2047,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
           ...(clipRef ? { video: clipRef.dataUrl } : {}),
           ...(continuationVideo ? { continuationVideo } : {}),
           ...(continuation ? { continuation: true } : {}),
+          renderId,
           // A reference clip is always rewritten, and the server owns that
           // model, so this mode sends no brain of its own.
           enhance: videoMode !== "free" || brain !== null,
@@ -1857,63 +2074,12 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
 
       // The blueprint may have been dragged while the clip rendered.
       const placed = pendingRef.current.find((slot) => slot.id === renderId);
-
-      const storedSrc = await putDataUrl(data.src, "clip.mp4");
-      // The keyframe modes ignore the character and background slots, so the
-      // frame only records what was actually sent.
-      const keyed = Boolean(firstFrame || lastFrame);
-      const storedCharacters = keyed ? [] : await Promise.all(characters.map((item) => putJpeg(item.base64)));
-      const storedBackground = keyed || !background ? undefined : await putJpeg(background.base64);
-
-      const frame: Frame = {
-        id: renderId,
-        src: storedSrc,
-        prompt: data.prompt?.trim() || caption,
-        // An empty prompt stays empty: the caption labels the frame, it is not
-        // something the person typed, and a reuse must not hand it back as one.
-        sourcePrompt: (data.sourcePrompt ?? value).trim(),
-        enhanced: data.enhanced === true,
-        // A reference mode rewrites unconditionally, so it has no enhancer to
-        // record; leaving the field out says "not applicable" rather than
-        // "off", which would turn the button off for the user.
-        recipe: {
-          tab: "video",
-          ...(videoMode === "free" ? { flavor: brain } : {}),
-          ratio: videoRatio,
-          resolution: videoResolution,
-          video: {
-            model: data.model ?? videoModel,
-            mode: videoMode,
-            ratio: videoRatio,
-            resolution: videoResolution,
-            duration: videoDuration,
-          },
-        },
-        characterSrcs: storedCharacters,
-        backgroundSrc: storedBackground,
-        media: "video",
-        seconds: videoDuration,
-        style: "none",
-        model: data.model ?? videoModel,
-        x: placed?.x ?? position.x,
-        y: placed?.y ?? position.y,
-        createdAt: Date.now(),
-      };
+      const frame = await clipFrame(renderId, { ...data, src: data.src }, meta, placed ?? position);
 
       await applyProjectUpdate((current) => ({
         ...current,
         frames: [...current.frames, frame].slice(0, MAX_FRAMES),
-        messages: [
-          ...current.messages,
-          {
-            id: crypto.randomUUID(),
-            role: "assistant" as const,
-            text: value
-              ? `Clip · ${videoModeLabel(videoMode)}: ${frame.prompt}`
-              : `Clip · ${videoModeLabel(videoMode)}`,
-            createdAt: Date.now(),
-          },
-        ],
+        messages: [...current.messages, clipMessage(meta, frame)],
         updatedAt: Date.now(),
       }));
 
@@ -1934,9 +2100,86 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         void verifyLocalConfig({ unet: localConfig?.unet, clip: localConfig?.clip });
       }
     } finally {
+      // The answer came straight back, success or not, so the server's kept
+      // copy (for a page that reloaded) can go.
+      void fetch(`/api/video/result?id=${encodeURIComponent(renderId)}`, { method: "DELETE" }).catch(() => {});
       releaseInFlight(projectId, [renderId]);
       setPending((list) => list.filter((slot) => slot.id !== renderId));
       setBusy(false);
+    }
+  }
+
+  /**
+   * Collect a clip whose page reloaded while it rendered.
+   *
+   * The server finished (or is still running) the render and keeps its answer
+   * under the tile id, so this waits on the tile's progress record and then
+   * takes the answer. Three misses in a row mean the server holds nothing —
+   * it restarted, or the clip is older than it keeps — and the tile goes with
+   * a message rather than spinning forever. Leaving the canvas stops the
+   * wait without forgetting the clip; the next visit picks it up again.
+   */
+  async function resumeClip(clip: SavedClip) {
+    const id = clip.slot.id;
+    if (resumingClips.has(id)) return;
+    resumingClips.add(id);
+    let settled = false;
+    let misses = 0;
+    try {
+      while (mountedRef.current) {
+        let stage: string | undefined;
+        let error: string | undefined;
+        try {
+          const response = await fetch(`/api/video/progress?id=${encodeURIComponent(id)}`, { cache: "no-store" });
+          if (response.ok) {
+            ({ stage, error } = (await response.json()) as { stage?: string; error?: string });
+            misses = 0;
+          } else if (response.status === 404) {
+            misses += 1;
+          }
+        } catch {
+          // The app server is down for a moment; keep waiting.
+        }
+
+        if (stage === "done") {
+          const response = await fetch(`/api/video/result?id=${encodeURIComponent(id)}`, { cache: "no-store" });
+          const data = (await response.json().catch(() => ({}))) as Parameters<typeof clipFrame>[1] & { error?: string };
+          settled = true;
+          if (!response.ok || !data.src) {
+            setFailed(true);
+            setStatus(data.error ?? "The clip finished, but it could not be collected after the reload.");
+            break;
+          }
+          const placed = pendingRef.current.find((slot) => slot.id === id) ?? clip.slot;
+          const frame = await clipFrame(id, data, clip.meta, placed);
+          await applyProjectUpdate((current) => ({
+            ...current,
+            frames: [...current.frames, frame].slice(0, MAX_FRAMES),
+            messages: [...current.messages, clipMessage(clip.meta, frame)],
+            updatedAt: Date.now(),
+          }));
+          break;
+        }
+        if (stage === "failed") {
+          settled = true;
+          setFailed(true);
+          setStatus(error ?? "The clip could not be rendered.");
+          break;
+        }
+        if (misses >= 3) {
+          settled = true;
+          setFailed(true);
+          setStatus("A clip that was rendering before the page reloaded could not be recovered.");
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 3_000));
+      }
+    } finally {
+      resumingClips.delete(id);
+      if (settled) {
+        forgetClips([id]);
+        if (mountedRef.current) setPending((list) => list.filter((slot) => slot.id !== id));
+      }
     }
   }
 
@@ -2457,19 +2700,33 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
 
           {/* Renders in flight: a blueprint square holds the slot and fills from
               the bottom while the work is running. */}
-          {pending.map((slot) => (
-            <div
-              key={slot.id}
-              className="stage-frame is-pending"
-              data-kind={slot.kind}
-              style={{ width: FRAME_SIZE, height: FRAME_SIZE, transform: `translate(${slot.x}px, ${slot.y}px)` }}
-              onPointerDown={(event) => startPendingDrag(event, slot)}
-              title="Drag to place this render"
-            >
-              <span className="pending-label">{slot.kind === "video" ? "Rendering clip…" : "Rendering still…"}</span>
-              <span className="pending-prompt">{slot.prompt}</span>
-            </div>
-          ))}        </div>
+          {pending.map((slot) => {
+            const track = tracks[slot.id];
+            const fraction = trackFraction(track);
+            return (
+              <div
+                key={slot.id}
+                className={`stage-frame is-pending${fraction !== undefined ? " is-tracked" : ""}`}
+                data-kind={slot.kind}
+                style={
+                  {
+                    width: FRAME_SIZE,
+                    height: FRAME_SIZE,
+                    transform: `translate(${slot.x}px, ${slot.y}px)`,
+                    ...(fraction !== undefined ? { "--pending-progress": `${Math.round(fraction * 100)}%` } : {}),
+                  } as React.CSSProperties
+                }
+                onPointerDown={(event) => startPendingDrag(event, slot)}
+                title="Drag to place this render"
+              >
+                <span className="pending-label">
+                  {track?.label ?? (slot.kind === "video" ? "Rendering clip…" : "Rendering still…")}
+                </span>
+                {track && <span className="pending-clock">{clock(track.elapsed)}</span>}
+                <span className="pending-prompt">{slot.prompt}</span>
+              </div>
+            );
+          })}        </div>
 
         {/* The hint is for an untouched canvas. A pending slot means a Generate
             press has already landed, so the ghost would only sit on top of the
@@ -3653,6 +3910,20 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                   disabled={localBusy}
                   onChange={(event) => setLocalDraft((current) => ({ ...current, steps: event.target.value }))}
                 />
+
+                <label htmlFor="local-ref-video">Video reference cap</label>
+                <select
+                  id="local-ref-video"
+                  value={localDraft.refVideoEdge}
+                  disabled={localBusy}
+                  onChange={(event) => setLocalDraft((current) => ({ ...current, refVideoEdge: event.target.value }))}
+                >
+                  {REF_VIDEO_EDGES.map((edge) => (
+                    <option key={edge} value={edge}>
+                      {edge === 0 ? "Match output" : `Up to ${edge}p`}
+                    </option>
+                  ))}
+                </select>
 
                 {localError && (
                   <p className="account-error" role="alert">

@@ -13,6 +13,8 @@ import {
   localDimensions,
   localFiles,
   localFrames,
+  mp4VideoSize,
+  refVideoDimensions,
   splitDataUri,
   surfaceFromStatus,
 } from "../lib/local-video.ts";
@@ -49,7 +51,7 @@ test("the configuration names the loaders and the step count", () => {
 test("a missing or partial config falls back to the defaults", () => {
   assert.deepEqual(localModelConfig(undefined), { ...LOCAL_MODEL_DEFAULTS });
   assert.deepEqual(localModelConfig({ unet: "  " }), { ...LOCAL_MODEL_DEFAULTS });
-  assert.deepEqual(localModelConfig({ unet: "u", clip: "c", steps: 999 }), { unet: "u", clip: "c", steps: 200 });
+  assert.deepEqual(localModelConfig({ unet: "u", clip: "c", steps: 999 }), { unet: "u", clip: "c", steps: 200, refVideoEdge: 0 });
   assert.equal(localModelConfig({ steps: 0 }).steps, 1);
   assert.equal(localModelConfig({ steps: "nope" }).steps, LOCAL_MODEL_DEFAULTS.steps);
 });
@@ -246,6 +248,58 @@ test("a motion reference becomes a LoadVideo node", () => {
   // the clip keeps H3's generated audio.
   assert.equal(plan.audioSource, "generated");
   assert.deepEqual(plan.graph["14"]?.inputs.audio, ["13", 0]);
+});
+
+/** The smallest MP4 header `mp4VideoSize` reads: one 92-byte `tkhd` with a size. */
+function mp4WithSize(width: number, height: number) {
+  const box = new Uint8Array(92);
+  const view = new DataView(box.buffer);
+  view.setUint32(0, 92);
+  box.set([0x74, 0x6b, 0x68, 0x64], 4);
+  view.setUint32(84, width * 65536);
+  view.setUint32(88, height * 65536);
+  return `data:video/mp4;base64,${Buffer.from(box).toString("base64")}`;
+}
+
+test("a reference cap scales the guide without touching the output", () => {
+  const input = { prompt: "x", mode: "video" as const, ratio: "16:9", resolution: "768P" as const, duration: 5, video: MP4 };
+  const plan = buildLocalVideoGraph(input, { ...DEFAULT_LOCAL_FILES, refVideoEdge: 480 });
+
+  assert.deepEqual([plan.width, plan.height], [1344, 768]);
+  assert.deepEqual([plan.graph["5"]!.inputs.width, plan.graph["5"]!.inputs.height], [1344, 768]);
+  assert.deepEqual([plan.graph["303"]!.inputs.width, plan.graph["303"]!.inputs.height], [832, 480]);
+  assert.deepEqual(refVideoDimensions(1344, 768, 0), { width: 1344, height: 768 });
+  // A cap above the output still raises the guide, rounded down onto the grid.
+  assert.deepEqual(refVideoDimensions(768, 1344, 1080), { width: 1072, height: 1888 });
+});
+
+test("a clip smaller than the output or the cap is never upscaled", () => {
+  const input = { prompt: "x", mode: "video" as const, ratio: "16:9", resolution: "768P" as const, duration: 5 };
+  const guide = (video: string, refVideoEdge = 0) => {
+    const node = buildLocalVideoGraph({ ...input, video }, { ...DEFAULT_LOCAL_FILES, refVideoEdge }).graph["303"]!;
+    return [node.inputs.width, node.inputs.height];
+  };
+
+  // 288p clip, "match output": stays at 288p instead of being blown up to 768.
+  assert.deepEqual(guide(mp4WithSize(512, 288)), [496, 288]);
+  // 288p clip under a 720p cap: still its own size.
+  assert.deepEqual(guide(mp4WithSize(512, 288), 720), [496, 288]);
+  // 1080p clip: the output's size, or the cap, whichever is asked for.
+  assert.deepEqual(guide(mp4WithSize(1920, 1080)), [1344, 768]);
+  assert.deepEqual(guide(mp4WithSize(1920, 1080), 480), [832, 480]);
+  // A size the container does not give (WebM, or junk) scales as before.
+  assert.deepEqual(guide(MP4), [1344, 768]);
+
+  assert.deepEqual(mp4VideoSize(Buffer.from(mp4WithSize(1376, 768).split(",")[1]!, "base64")), { width: 1376, height: 768 });
+  assert.equal(mp4VideoSize(new Uint8Array(16)), undefined);
+});
+
+test("the reference edge survives the config round trip, and odd values fall back", () => {
+  assert.equal(localModelConfig({ refVideoEdge: 720 }).refVideoEdge, 720);
+  assert.equal(localModelConfig({ refVideoEdge: "576" }).refVideoEdge, 576);
+  assert.equal(localModelConfig({ refVideoEdge: 333 }).refVideoEdge, 0);
+  assert.equal(localModelConfig(undefined).refVideoEdge, 0);
+  assert.equal(localFiles(localModelConfig({ refVideoEdge: 360 }), env({})).refVideoEdge, 360);
 });
 
 test("a motion reference with its own sound keeps that sound", () => {

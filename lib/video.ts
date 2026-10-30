@@ -316,9 +316,23 @@ export const LOCAL_MODEL_DEFAULTS = {
   unet: "fasth3_omniref_8step_pruned_int8_convrot.safetensors",
   clip: "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
   steps: 8,
+  refVideoEdge: 0,
 } as const;
 
-export type LocalModelConfig = { unet: string; clip: string; steps: number };
+/**
+ * Caps on a motion reference's short edge before H3 encodes it. `0` means the
+ * render's own size, which is what the graph has always done. A clip already
+ * under the cap keeps its own size: nothing is upscaled.
+ */
+export const REF_VIDEO_EDGES = [0, 288, 360, 480, 576, 720, 768, 1080] as const;
+
+export type LocalModelConfig = {
+  unet: string;
+  clip: string;
+  steps: number;
+  /** Cap on the motion reference's short edge, or 0 for the output's own. */
+  refVideoEdge?: number;
+};
 
 /** Fill a partial/unknown config from defaults, clamped to sane values. */
 export function localModelConfig(value: unknown): LocalModelConfig {
@@ -327,11 +341,14 @@ export function localModelConfig(value: unknown): LocalModelConfig {
   const clip = typeof source.clip === "string" ? source.clip.trim() : "";
   const raw = typeof source.steps === "number" ? source.steps : Number(source.steps);
   const steps = Number.isFinite(raw) ? Math.min(200, Math.max(1, Math.round(raw))) : LOCAL_MODEL_DEFAULTS.steps;
+  const edge = Number(source.refVideoEdge);
+  const refVideoEdge = (REF_VIDEO_EDGES as readonly number[]).includes(edge) ? edge : LOCAL_MODEL_DEFAULTS.refVideoEdge;
 
   return {
     unet: unet || LOCAL_MODEL_DEFAULTS.unet,
     clip: clip || LOCAL_MODEL_DEFAULTS.clip,
     steps,
+    refVideoEdge,
   };
 }
 
