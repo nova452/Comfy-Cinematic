@@ -4,7 +4,7 @@
 
 **A project canvas for stills and clips, built on Comfy.** Open a project, describe a frame or a
 shot, and the result lands on an infinite canvas you can pan, zoom, drag, undo and share. Render
-through Comfy Router, or run the same models on your own ComfyUI or a Comfy deployment.
+through Comfy Router, or run the same models on your own ComfyUI or a Comfy deployment. #OpenSourceHiggsfield
 
 **▶ Live demo: [comfy-cinematic.ai.studio](https://comfy-cinematic.ai.studio/)**
 
