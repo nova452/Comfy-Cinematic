@@ -122,6 +122,31 @@ download anything you want to keep.
 
 ---
 
+### Required resources
+
+Only needed for the **Local** models and Openjutsu Prime; Router models need just the key.
+
+**Models**
+
+| Folder | File | Used by |
+| --- | --- | --- |
+| `diffusion_models` | `fasth3_omniref_8step_pruned_int8_convrot.safetensors` | H3 Local, Openjutsu Prime |
+| `diffusion_models` | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | Openjutsu Prime |
+| `diffusion_models` | `flux3-image-klein-int8-convrot0.safetensors` | FLUX 3 Local |
+| `loras` | `pika_h3_flex_ref2va_v1_bf16.safetensors` | Openjutsu Prime |
+| `loras` | `minimax_h3_open_regenerate_2k_refiner_rank_16_bf16.safetensors` (or `…rank_384…`) | Openjutsu Prime, upscale only |
+| `text_encoders` | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` (or the `int8_convrot` build) | H3 Local, Openjutsu Prime |
+| `text_encoders` | `qwen3vl_4b_fp8_scaled.safetensors` | FLUX 3 Local |
+| `vae` | `minimax_h3_video_vae_fp16.safetensors`, `minimax_h3_audio_vae_fp32.safetensors` | H3 Local, Openjutsu Prime |
+| `vae` | `flux2-vae.safetensors` | FLUX 3 Local |
+| `latent_upscale_models` | `minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors` | Openjutsu Prime, upscale only |
+
+File names can be changed in each model's gear (and its **Extras**), and **Verify** checks them on
+your target.
+
+**Custom nodes**
+Grab them at [main/Packaged Nodes](https://github.com/nova452/Comfy-Cinematic/tree/main/Packaged%20nodes)
+
 ## Run it yourself
 
 You need Node 22.6+ and a [Comfy API key](https://platform.comfy.org/profile/api-keys?onboarding=router)
