@@ -149,29 +149,11 @@ Grab them at [main/Packaged Nodes](https://github.com/nova452/Comfy-Cinematic/tr
 
 ## Run it yourself
 
-You need Node 22.6+ and a [Comfy API key](https://platform.comfy.org/profile/api-keys?onboarding=router)
-for a workspace with Router access.
-
 ```bash
 npm ci
 cp .env.example .env.local
 npm run dev
 ```
-
-Open <http://127.0.0.1:3000> and sign in from the header. Or put the key in `COMFY_API_KEY` for a
-self-hosted studio. For local renders, open **Manage account** and point it at your deployment or
-your ComfyUI.
-
-### Main settings
-
-| Variable | Purpose |
-| --- | --- |
-| `COMFY_API_KEY` | Router credential for a self-hosted studio. A key entered in the header wins over it. |
-| `COMFY_BASE_URL` | Forces the local render target (e.g. `http://127.0.0.1:8189`), overriding Manage account. |
-| `PUBLIC_HOSTING` | Set to `1` on a shared host: the host's keys are never lent to visitors, and render targets must be public addresses. |
-| `H3_VAE_VIDEO` / `H3_VAE_AUDIO` / `FLUX_VAE` | VAE file names for the local graphs. |
-
-The full list is in [`.env.example`](.env.example).
 
 ### Hosting it for others
 
