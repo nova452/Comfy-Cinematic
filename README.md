@@ -27,8 +27,7 @@ take with MiniMax H3 Max, the characters with FLUX 3, and each world with Openju
   take: people, anime or a cat.
 
   ![Original two-person dance, then the same dance with an anime girl, then with a cat and a pink-haired man](docs/media/openjutsu-crew.gif)
-- **Keeps the identity.** Every reference is redrawn as a clean H3 character sheet first, so weird
-  faces, wild hair and a mustache you could hang a coat on survive, where Genjutsu's take on the
+- **Keeps the identity.** Weird faces, wild hair and a mustache, where Genjutsu's take on the
   same reference drifts.
 
   ![The character reference, Genjutsu's take, and Openjutsu Prime's take labelled Strongest identity](docs/media/openjutsu-identity.jpg)
