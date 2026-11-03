@@ -23,10 +23,6 @@ person you want cast, and either press **Auto** or write it: *"Replace the runni
 take with MiniMax H3 Max, the characters with FLUX 3, and each world with Openjutsu Prime. A
 10-second clip at 1k takes about 11 minutes on a Comfy deployment.
 
-- **Cast the whole crew.** Swap one person or everyone in the shot, up to 8 characters in a single
-  take: people, anime or a cat.
-
-  ![Original two-person dance, then the same dance with an anime girl, then with a cat and a pink-haired man](docs/media/openjutsu-crew.gif)
 - **Keeps the identity.** Weird faces, wild hair and a mustache, where Genjutsu's take on the
   same reference drifts.
 
