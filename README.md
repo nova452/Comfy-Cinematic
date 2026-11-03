@@ -3,7 +3,7 @@
 ![Comfy Cinematic](docs/media/home.png)
 
 **A project canvas for stills and clips, built on Comfy.** Open a project, describe a frame or a
-shot, and the result lands on a canvas you can pan, zoom, drag, undo and share. Render
+shot, and a canvas you can pan, zoom, drag, undo and share. Render
 through Comfy Router, or run the same models on your own ComfyUI or a Comfy deployment.
 
 **▶ Try it: [comfy-cinematic.ai.studio](https://comfy-cinematic.ai.studio/)**
