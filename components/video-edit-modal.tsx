@@ -19,7 +19,8 @@ type Props = {
   onApply: (file: File, seconds: number) => void;
 };
 
-const MIN_WINDOW = 0.5;
+/** Shortest trim window the editor allows, unless the clip itself is shorter. */
+const MIN_WINDOW = 5;
 /** Longest edge of the redrawn clip. */
 const MAX_EDGE = 1280;
 const PREVIEW_HEIGHT = 280;
@@ -49,6 +50,8 @@ export function VideoEditModal({ file, onCancel, onApply }: Props) {
   const [working, setWorking] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string>();
+  /** Whether the pointer went down on the backdrop itself, not inside the panel. */
+  const backdropPress = useRef(false);
 
   useEffect(() => {
     const next = URL.createObjectURL(file);
@@ -69,6 +72,8 @@ export function VideoEditModal({ file, onCancel, onApply }: Props) {
   }, [onCancel, working]);
 
   const duration = Math.max(0, end - start);
+  // A clip shorter than five seconds can only offer what it has.
+  const minWindow = total > 0 ? Math.min(MIN_WINDOW, total) : MIN_WINDOW;
   const crop = cropRect(size.width, size.height, aspect, zoom, focus.x, focus.y);
   const opened = size.width > 0 && size.height > 0;
   const edited = opened && !isUnedited(total, start, end, crop, size.width, size.height);
@@ -170,7 +175,7 @@ export function VideoEditModal({ file, onCancel, onApply }: Props) {
       onApply(file, total);
       return;
     }
-    if (duration < MIN_WINDOW || !mime) {
+    if (duration < minWindow || !mime) {
       if (!mime) setError("This browser cannot re-encode a clip. Use the original.");
       return;
     }
@@ -206,7 +211,17 @@ export function VideoEditModal({ file, onCancel, onApply }: Props) {
       role="dialog"
       aria-modal="true"
       aria-label="Edit clip"
-      onClick={close}
+      onPointerDown={(event) => {
+        backdropPress.current = event.target === event.currentTarget;
+      }}
+      onClick={() => {
+        // A trim or pan drag can end outside the panel, and the browser then
+        // reports the click on the backdrop. Only a press that started there
+        // closes the editor.
+        if (!backdropPress.current) return;
+        backdropPress.current = false;
+        close();
+      }}
     >
       <div className="modal video-edit-panel" onClick={(event) => event.stopPropagation()}>
         <header>
@@ -267,7 +282,7 @@ export function VideoEditModal({ file, onCancel, onApply }: Props) {
           total={total}
           start={start}
           end={end}
-          min={MIN_WINDOW}
+          min={minWindow}
           max={total}
           step={0.1}
           disabled={working || !opened}
@@ -291,8 +306,8 @@ export function VideoEditModal({ file, onCancel, onApply }: Props) {
 
         <p className="video-edit-note">
           {edited
-            ? `Crop ${output.width}×${output.height}. The edit is re-encoded in this browser.`
-            : "Untouched. The original file is added as-is."}
+            ? `Crop ${output.width}×${output.height}, re-encoded in this browser.`
+            : "Untouched. Original file added as-is."}
         </p>
 
         {working && (
@@ -318,7 +333,7 @@ export function VideoEditModal({ file, onCancel, onApply }: Props) {
             type="button"
             className="primary"
             onClick={() => void apply()}
-            disabled={working || total <= 0 || (edited && (duration < MIN_WINDOW || !canEncode))}
+            disabled={working || total <= 0 || (edited && (duration < minWindow || !canEncode))}
           >
             {working ? "Rendering…" : edited ? "Add edited clip" : "Add clip"}
           </button>

@@ -29,6 +29,13 @@ import { activeEndpoint, endpointKey, readAccount, routerKey } from "../../../li
 import { readLocalImageConfig } from "../../../lib/local-image-config";
 import { runLocalImage } from "../../../lib/local-image";
 import {
+  CANCELLED_MESSAGE,
+  cancelSignal,
+  finishProgress,
+  isRenderId,
+  reportProgress,
+} from "../../../lib/render-progress";
+import {
   STUDIO_SYSTEM_PROMPT,
   describePlan,
   describeStudioState,
@@ -65,6 +72,11 @@ type HarnessRequest = {
   background?: unknown;
   /** The Create panel's Generate: always render, never answer. */
   render?: unknown;
+  /**
+   * The tile id a render's answer is kept under, so a page that reloaded can
+   * still collect it and a tile's ✕ can cancel it. Renders only.
+   */
+  renderId?: unknown;
 };
 
 function requestIdOf(error: unknown) {
@@ -74,12 +86,39 @@ function requestIdOf(error: unknown) {
 }
 
 export async function POST(request: Request) {
+  // Filled once the body is read. The answer is kept under that id, as the
+  // video route does, so a page that reloaded mid-render can still collect it.
+  const progress: { id?: string } = {};
+  let response: Response;
+  try {
+    response = await handle(request, progress);
+  } catch (error) {
+    console.error("[harness] unhandled failure", error);
+    response = NextResponse.json(
+      { error: error instanceof Error ? error.message : "The render failed.", code: "render_crashed" },
+      { status: 500 },
+    );
+  }
+  if (progress.id) {
+    const body: unknown = await response.clone().json().catch(() => undefined);
+    finishProgress(progress.id, response.ok, body);
+  }
+  return response;
+}
+
+async function handle(request: Request, progress: { id?: string }) {
   let body: HarnessRequest;
   try {
     body = (await request.json()) as HarnessRequest;
   } catch {
     return NextResponse.json({ error: "Send a JSON request." }, { status: 400 });
   }
+  if (isRenderId(body.renderId)) {
+    progress.id = body.renderId;
+    reportProgress(progress.id, { stage: "starting" });
+  }
+  // The tile's ✕ (`/api/render/cancel`) fires this; every step below hears it.
+  const signal = cancelSignal(progress.id);
 
   const sourcePrompt = typeof body.prompt === "string" ? body.prompt.replace(/\s+/g, " ").trim() : "";
   if (sourcePrompt.length < 2) {
@@ -225,7 +264,7 @@ export async function POST(request: Request) {
         const result = await runModel(apiKey, 
           brain,
           buildBrainRequest(brain, sourcePrompt, IMAGE_SYSTEM_PROMPT),
-          { timeoutMs: 60_000 },
+          { timeoutMs: 60_000, signal },
         );
         const text = result.kind === "json" ? readBrainText(brain, result.data) : undefined;
         const rewritten = text ? parseVideoPrompt(text) : undefined;
@@ -258,7 +297,7 @@ export async function POST(request: Request) {
     brainError = "No API key";
   } else {
     try {
-      const result = await runModel(apiKey, brain, buildBrainRequest(brain, sourcePrompt), { timeoutMs: 60_000 });
+      const result = await runModel(apiKey, brain, buildBrainRequest(brain, sourcePrompt), { timeoutMs: 60_000, signal });
       if (result.kind !== "json") throw new Error("The brain returned a binary response.");
 
       const text = readBrainText(brain, result.data);
@@ -314,6 +353,12 @@ export async function POST(request: Request) {
     decision = { intent: "image", prompt: sourcePrompt };
   }
 
+  // A cancel during the rewrite was swallowed as a failed rewrite; stop here.
+  if (signal?.aborted) {
+    return NextResponse.json({ error: CANCELLED_MESSAGE, code: "cancelled" }, { status: 409 });
+  }
+  if (progress.id) reportProgress(progress.id, { stage: "running" });
+
   // The toggle is the contract: on, the model's rewrite is used; off, the
   // typed prompt goes through untouched.
   const subject = pickSubject(decision, sourcePrompt, enhance);
@@ -358,6 +403,7 @@ export async function POST(request: Request) {
         apiKey: endpointKey(account),
         baseUrl: endpoint,
         config: await readLocalImageConfig(request),
+        signal,
       };
       // A text-to-image graph batches internally; the edit graph has one
       // latent, so a batch is that many jobs.
@@ -411,7 +457,7 @@ export async function POST(request: Request) {
 
     // FLUX 3 returns one image per call, so a batch is N calls.
     const results = await Promise.all(
-      Array.from({ length: batch }, () => runModel(apiKey, tool.model, input, { timeoutMs: 300_000 })),
+      Array.from({ length: batch }, () => runModel(apiKey, tool.model, input, { timeoutMs: 300_000, signal })),
     );
 
     const srcs = await Promise.all(
@@ -454,6 +500,9 @@ export async function POST(request: Request) {
       requestId: results[0]?.requestId ?? null,
     });
   } catch (error) {
+    if (signal?.aborted) {
+      return NextResponse.json({ error: CANCELLED_MESSAGE, code: "cancelled" }, { status: 409 });
+    }
     const message = error instanceof Error ? error.message : "The render failed.";
     const requestId = requestIdOf(error);
     return NextResponse.json(

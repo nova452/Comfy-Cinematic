@@ -3,13 +3,25 @@
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { deleteProject, listProjects, writeProject } from "../lib/browser-projects";
-import { mediaUrl, useMediaVersion } from "../lib/browser-media";
-import { createProject, relativeTime, type ProjectSummary } from "../lib/projects";
+import { mediaUrl, PLACEHOLDER, useMediaVersion } from "../lib/browser-media";
+import { createProject, isVideoSrc, relativeTime, type ProjectSummary } from "../lib/projects";
 import { GITHUB_REPO } from "../lib/share";
 import { AccountMenu } from "./account-menu";
 
 // Placeholder footage for the home reel — swap the file, not the markup.
 const HERO_REEL = "/media/hero-reel.mp4";
+
+/**
+ * A clip's card shows its own first frame.
+ *
+ * An `img` cannot draw a clip, and a `video` sits blank until something plays
+ * it — so the media fragment makes the browser seek and paint just past the
+ * start. The placeholder is a data URI with nothing to seek, so it is left
+ * alone.
+ */
+function clipPoster(url: string) {
+  return url === PLACEHOLDER ? url : `${url}#t=0.1`;
+}
 
 export function ProjectsHome() {
   const router = useRouter();
@@ -111,7 +123,7 @@ export function ProjectsHome() {
         <div className="home-bar-right">
           <AccountMenu />
           <button type="button" className="primary" onClick={() => void create()} disabled={busy}>
-            {busy ? "Creating⬦" : "New project"}
+            {busy ? "Creating…" : "New project"}
           </button>
         </div>
       </header>
@@ -140,7 +152,7 @@ export function ProjectsHome() {
             <span />
           </div>
           <h2>Nothing on the board</h2>
-          <p>Start a canvas and describe what you want to see.</p>
+          <p>Start a canvas and describe a shot.</p>
           <button type="button" className="primary" onClick={() => void create()} disabled={busy}>
             Start a project
           </button>
@@ -156,7 +168,29 @@ export function ProjectsHome() {
                 aria-label={`Open ${project.name}`}
               >
                 <span className="project-thumb">
-                  {project.preview ? <img src={mediaUrl(project.preview)} alt="" /> : <span className="project-blank">Empty canvas</span>}
+                  {project.preview ? (
+                    isVideoSrc(project.preview) ? (
+                      <>
+                        <video
+                          src={clipPoster(mediaUrl(project.preview))}
+                          muted
+                          playsInline
+                          preload="metadata"
+                          tabIndex={-1}
+                          aria-hidden="true"
+                        />
+                        <span className="project-play" aria-hidden="true">
+                          <svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor">
+                            <path d="M8 5l11 7-11 7z" />
+                          </svg>
+                        </span>
+                      </>
+                    ) : (
+                      <img src={mediaUrl(project.preview)} alt="" />
+                    )
+                  ) : (
+                    <span className="project-blank">Empty canvas</span>
+                  )}
                 </span>
                 <span className="project-meta">
                   <strong>{project.name}</strong>
@@ -183,7 +217,7 @@ export function ProjectsHome() {
 
       <footer className="home-footer">
         <span>
-          Built on Comfy · FLUX 3 for stills, MiniMax H3 for clips
+          Built on Comfy · FLUX 3 stills, MiniMax H3 clips
         </span>
         <a href={GITHUB_REPO.url} target="_blank" rel="noreferrer noopener" title="Browse the source">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true">

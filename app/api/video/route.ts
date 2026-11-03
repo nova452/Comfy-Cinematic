@@ -2,8 +2,10 @@ import { runModel } from "../../../lib/router";
 import { dataUrl } from "../../../lib/media-data";
 import { NextResponse } from "next/server";
 import {
+  acceptsVideo,
   buildBrainRequest,
   DEFAULT_BRAIN,
+  parsePromptSpec,
   parseVideoPrompt,
   readBrainText,
   referencePrompt,
@@ -11,26 +13,31 @@ import {
   VIDEO_SYSTEM_PROMPT,
 } from "../../../lib/brain";
 import { MAX_PROMPT } from "../../../lib/harness";
-import { activeEndpoint, endpointKey, readAccount, routerKey } from "../../../lib/account";
+import { activeEndpoint, endpointKey, envOpenRouterKey, envRouterKey, readAccount, routerKey } from "../../../lib/account";
 import { buildReferencePrompt, buildReferenceRequest, parseReferenceRewrite, buildContinuationPrompt } from "../../../lib/reference";
 import { runLocalVideo } from "../../../lib/local-video";
 import {
   DEFAULT_VIDEO_MODEL,
-  MAX_VIDEO_IMAGES,
+  OPENJUTSU_DEFAULTS,
+  OPENJUTSU_MODEL_ID,
   buildVideoRequest,
   findVideoModel,
+  isRef5Render,
+  maxCharacterImages,
   findVideoRatio,
   findVideoResolution,
   videoResultError,
   videoResultUrl,
   type VideoMode,
 } from "../../../lib/video";
-import { readLocalConfig } from "../../../lib/local-config";
+import { readLocalConfig, readOpenjutsuConfig } from "../../../lib/local-config";
 import { isBase64Value, isMediaUri } from "../../../lib/media-uri";
-import { finishProgress, isRenderId, reportProgress } from "../../../lib/render-progress";
+import { CANCELLED_MESSAGE, cancelSignal, finishProgress, isRenderId, reportProgress } from "../../../lib/render-progress";
 
 export const runtime = "nodejs";
-export const maxDuration = 900;
+// Openjutsu Prime may run 35 minutes (`OPENJUTSU_TIMEOUT_MS`); the rest stop
+// at 14. Five more cover its uploads and download.
+export const maxDuration = 2400;
 
 const DEFAULT_MODEL = process.env.HARNESS_MODEL?.trim() || DEFAULT_BRAIN;
 
@@ -57,6 +64,10 @@ type VideoRequest = {
   brain?: unknown;
   /** The canvas tile's id, under which `/api/video/progress` reports this render. */
   renderId?: unknown;
+  /** Openjutsu with the prompt off: the graph plans the edit. */
+  auto?: unknown;
+  /** Openjutsu: where the trim window starts in the clip, in seconds. */
+  start?: unknown;
 };
 
 function requestIdOf(error: unknown) {
@@ -132,6 +143,8 @@ async function render(request: Request, progress: { id?: string }) {
     progress.id = body.renderId;
     reportProgress(progress.id, { stage: "starting" });
   }
+  // The tile's ✕ (`/api/render/cancel`) fires this; every step below hears it.
+  const signal = cancelSignal(progress.id);
 
   const sourcePrompt = typeof body.prompt === "string" ? body.prompt.replace(/\s+/g, " ").trim() : "";
   // A reference mode can run on the attachments alone, so only a one-character
@@ -165,20 +178,41 @@ async function render(request: Request, progress: { id?: string }) {
     );
   }
 
+  const background = typeof body.background === "string" ? body.background : "";
+  if (background && !isBase64(background, MAX_REFERENCE_CHARS)) {
+    return NextResponse.json({ error: "The background reference is not a valid image." }, { status: 400 });
+  }
+
+  // Openjutsu turns each of up to eight characters into a sheet and takes no
+  // background; everything else keeps Router's three.
+  const ref5 = isRef5Render(model, mode, body.continuation === true);
+  const maxCharacters = maxCharacterImages(model, mode, body.continuation === true);
+  // With the prompt off, the graph's own prompt model plans the edit.
+  const auto = ref5 && body.auto === true;
+  // Openjutsu takes the whole clip and cuts the trim window in its loader.
+  const start =
+    ref5 && typeof body.start === "number" && Number.isFinite(body.start) && body.start > 0
+      ? Math.min(body.start, 6 * 60 * 60)
+      : 0;
+  if (ref5 && !auto && sourcePrompt.length < 2) {
+    return NextResponse.json(
+      { error: "Describe the edit, or turn the prompt off to let the model decide." },
+      { status: 400 },
+    );
+  }
   const characterList = Array.isArray(body.characters) ? body.characters : [];
   const characters = characterList.filter((item): item is string => typeof item === "string" && item.length > 0);
-  if (characters.length > MAX_VIDEO_IMAGES) {
-    return NextResponse.json({ error: `At most ${MAX_VIDEO_IMAGES} character references.` }, { status: 400 });
+  if (characters.length > maxCharacters) {
+    return NextResponse.json({ error: `At most ${maxCharacters} character references.` }, { status: 400 });
   }
   for (const reference of characters) {
     if (!isBase64(reference, MAX_REFERENCE_CHARS)) {
       return NextResponse.json({ error: "A character reference is not a valid image." }, { status: 400 });
     }
   }
-
-  const background = typeof body.background === "string" ? body.background : "";
-  if (background && !isBase64(background, MAX_REFERENCE_CHARS)) {
-    return NextResponse.json({ error: "The background reference is not a valid image." }, { status: 400 });
+  // Openjutsu casts characters into a clip; with none it has nothing to do.
+  if (ref5 && characters.length === 0) {
+    return NextResponse.json({ error: "Openjutsu Prime needs at least one character to cast into the clip." }, { status: 400 });
   }
 
   const firstFrame = typeof body.firstFrame === "string" ? body.firstFrame : "";
@@ -235,7 +269,11 @@ async function render(request: Request, progress: { id?: string }) {
   const apiKey = await routerKey(request);
   const endpoint = activeEndpoint(account);
   const local = model.provider === "local";
-  const localConfig = local ? await readLocalConfig(request) : undefined;
+  // Each local row keeps its own settings. A continuation renders the plain
+  // stack instead of the ref5 graph, but it is still Openjutsu's render.
+  const localConfig = local
+    ? await (model.id === OPENJUTSU_MODEL_ID ? readOpenjutsuConfig(request) : readLocalConfig(request))
+    : undefined;
 
   if (local) {
     if (!endpoint) {
@@ -243,6 +281,20 @@ async function render(request: Request, progress: { id?: string }) {
         {
           error: "Workflow renders need a Comfy deployment (Settings) or COMFY_BASE_URL pointing at your ComfyUI.",
           code: "missing_local_endpoint",
+        },
+        { status: 503 },
+      );
+    }
+    // The OpenRouter API (Kimi, and Light's border check) calls out of ComfyUI;
+    // without a key it answers with an error string and H3 would render from
+    // nothing. The Comfy API (Gemini) needs no OpenRouter key.
+    const promptApi = localConfig?.promptApi ?? OPENJUTSU_DEFAULTS.promptApi;
+    if (ref5 && promptApi === "openrouter" && !(localConfig?.openRouterKey || envOpenRouterKey())) {
+      return NextResponse.json(
+        {
+          error:
+            "Openjutsu Prime needs an OpenRouter key for the OR API. Add it in the model's gear, or set OPENROUTER_API_KEY.",
+          code: "missing_openrouter_key",
         },
         { status: 503 },
       );
@@ -259,15 +311,24 @@ async function render(request: Request, progress: { id?: string }) {
 
   // A reference is not a suggestion: audio and video reference modes hand a
   // model a clip plus a sentence, so the shot it writes is what the render is
-  // actually of. They always rewrite — with the account's prompt model, Gemini
-  // 3.8 Flash at medium thinking unless the account says otherwise — and the
-  // panel hides its Flavor button rather than pretending the choice is local.
+  // actually of. They always rewrite — with MiniMax H3 Local's gear model, or
+  // the account's Gemini 3.8 Flash at medium thinking — and the panel hides
+  // its Flavor button rather than pretending the choice is local.
   const reference = mode !== "free";
   // A continuation is the same clip read two ways: the prompt model watches all
   // of it, and only its tail is handed to H3 as a motion reference.
   const continuation = mode === "video" && body.continuation === true && Boolean(video);
-  const referenceSettings = reference ? referencePrompt(account) : undefined;
-  const enhance = reference || body.enhance !== false;
+  // MiniMax H3 Local's gear owns its reference rewrite model, since that is
+  // where the rewrite runs; the account's setting stays the Router default.
+  const localPrompt = local ? parsePromptSpec(localConfig?.promptModel ?? "") : undefined;
+  const referenceSettings = reference
+    ? localPrompt && acceptsVideo(localPrompt.brain)
+      ? localPrompt
+      : referencePrompt(account)
+    : undefined;
+  // The ref5 graph writes its own prompts from the clip and the character
+  // sheets it draws, so the user's words go to it untouched.
+  const enhance = !ref5 && (reference || body.enhance !== false);
   const brain = reference
     ? referenceSettings!.brain
     : resolveBrain(typeof body.brain === "string" ? body.brain : "", DEFAULT_MODEL);
@@ -297,6 +358,7 @@ async function render(request: Request, progress: { id?: string }) {
       const result = await runModel(apiKey, brain, request, {
         // Reading a clip takes longer than writing from a sentence.
         timeoutMs: reference ? 180_000 : 60_000,
+        signal,
       });
       if (result.kind === "json") {
         const text = readBrainText(brain, result.data);
@@ -315,12 +377,18 @@ async function render(request: Request, progress: { id?: string }) {
     }
   }
 
+  // A cancel during the rewrite was swallowed as a failed rewrite; stop here.
+  if (signal?.aborted) {
+    return NextResponse.json({ error: CANCELLED_MESSAGE, code: "cancelled" }, { status: 409 });
+  }
+
   const phrase = "";
   const finalPrompt = prompt;
 
   try {
     const usedCharacters = keyframes ? [] : characters;
-    const usedBackground = keyframes ? "" : background;
+    // The ref5 graph has no background slot: the clip is the scene.
+    const usedBackground = keyframes || ref5 ? "" : background;
 
     const images = [
       ...usedCharacters.map((reference) => `data:image/jpeg;base64,${reference}`),
@@ -336,6 +404,9 @@ async function render(request: Request, progress: { id?: string }) {
           resolution,
           duration,
           images,
+          ...(ref5 ? { openjutsu: true } : {}),
+          ...(auto ? { auto } : {}),
+          ...(start ? { start } : {}),
           ...(keyframes
             ? {
                 ...(firstFrame ? { firstFrame: `data:image/jpeg;base64,${firstFrame}` } : {}),
@@ -348,26 +419,37 @@ async function render(request: Request, progress: { id?: string }) {
         },
         // A hosted deployment refuses an anonymous /api/v2/jobs, so the
         // signed-in key goes with it; a local ComfyUI only takes its own.
+        // The Gemini prompt node is a partner node, which reads the Comfy key
+        // from extra_data, so the signed-in key rides along for it too.
         {
+          signal,
           apiKey: endpointKey(account),
           baseUrl: endpoint,
           config: localConfig,
+          ...(ref5 && (localConfig?.promptApi ?? OPENJUTSU_DEFAULTS.promptApi) !== "openrouter"
+            ? { orgKey: account?.key?.trim() || envRouterKey() }
+            : {}),
           onProgress: (update) => reportProgress(progress.id, update),
         },
       );
       const src = dataUrl(rendered.bytes, rendered.contentType);
 
+      // The ref5 graph reports the prompt its own model wrote for H3.
       return NextResponse.json({
         kind: "video",
         src,
-        prompt: finalPrompt,
+        prompt: rendered.prompt ?? finalPrompt,
         sourcePrompt,
-        enhanced,
+        enhanced: enhanced || Boolean(rendered.prompt),
         keyframes,
         mode,
         media: "video",
         model: model.id,
         requestId: rendered.requestId,
+        ...(rendered.timing ? { timing: rendered.timing } : {}),
+        // The upscale failed after the finished clip was saved; this is that
+        // clip, and the warning says so.
+        ...(rendered.fallback ? { fallback: true, warning: rendered.warning } : {}),
       });
     }
 
@@ -394,7 +476,8 @@ async function render(request: Request, progress: { id?: string }) {
     );
 
     reportProgress(progress.id, { stage: "running" });
-    const result = await runModel(apiKey, model.id, payload, { timeoutMs: 840_000 });
+    // On a cancel the SDK makes a best-effort cancel of the Router request too.
+    const result = await runModel(apiKey, model.id, payload, { timeoutMs: 840_000, signal });
     if (result.kind !== "json") throw new Error("The video model returned an unexpected binary response.");
 
     const url = videoResultUrl(result.data, model.api);
@@ -427,6 +510,9 @@ async function render(request: Request, progress: { id?: string }) {
       requestId: result.requestId ?? null,
     });
   } catch (error) {
+    if (signal?.aborted) {
+      return NextResponse.json({ error: CANCELLED_MESSAGE, code: "cancelled" }, { status: 409 });
+    }
     const message = error instanceof Error ? error.message : "The video render failed.";
     const requestId = requestIdOf(error);
     return NextResponse.json(

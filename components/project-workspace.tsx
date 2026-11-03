@@ -1,14 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { AccountMenu } from "./account-menu";
 import { ChipPicker } from "./chip-picker";
 import { ModelLogo } from "./model-logo";
 import { AssetPicker, type PickedAsset } from "./asset-picker";
 import { AssetLibrary } from "./asset-library";
-import { addUpload, renderAsset, toggleLiked, type Asset, type AssetKind } from "../lib/assets";
+import { SAMPLE_CLIPS, addUpload, renderAsset, toggleLiked, type Asset, type AssetKind } from "../lib/assets";
 import type { MediaFile, Reference } from "../lib/client-image";
 import { dataUrlFromBlob, mediaFromSrc, prepareReference } from "../lib/client-image";
 import {
@@ -16,6 +16,7 @@ import {
   onSettingsChange,
   readSettings,
   rememberLocalModel,
+  rememberOpenjutsu,
 } from "../lib/client-settings";
 import { deleteProject as forgetProject, readProject, writeProject } from "../lib/browser-projects";
 import { getMediaBlob, mediaUrl, putDataUrl, putJpeg, putMedia, useMediaVersion } from "../lib/browser-media";
@@ -23,7 +24,15 @@ import { recordTail } from "../lib/record-video";
 import { TrimModal } from "./trim-modal";
 import { ShareModal } from "./share-modal";
 import { LocalImageConfigDialog } from "./local-image-config";
-import { BRAIN_OPTIONS, FLAVOR_BRAINS, isFlavorId, type BrainOption } from "../lib/brain";
+import {
+  BRAIN_OPTIONS,
+  FLAVOR_BRAINS,
+  REFERENCE_PROMPT_SPEC,
+  acceptsVideo,
+  isFlavorId,
+  parsePromptSpec,
+  type BrainOption,
+} from "../lib/brain";
 import {
   DEFAULT_IMAGE_BATCH,
   DEFAULT_TOOL,
@@ -54,30 +63,57 @@ import {
   findVideoRatio,
   findVideoResolution,
   h3TierModels,
+  H3_LOCAL_MODEL_ID,
   LOCAL_MODEL_DEFAULTS,
+  OPENJUTSU_DEFAULTS,
+  OPENJUTSU_REF_VIDEO_EDGES,
+  OPENJUTSU_REF_VIDEO_LIMIT,
   REF_VIDEO_EDGES,
+  OPENJUTSU_MODE_OPTIONS,
+  OPENJUTSU_PROMPT_APIS,
+  OPENJUTSU_REFINER_LORAS,
+  REF2VA_LORA_DEFAULT,
+  REF2VA_UNET_DEFAULT,
+  REF5_UPSCALER_DEFAULT,
+  isBlankPromptError,
   localModelConfig,
+  isRef5Render,
   lockedByMode,
+  maxCharacterImages,
   ratioOptions,
   resolutionOptions,
   standaloneVideoModels,
+  supportsContinuation,
+  OPENJUTSU_MODEL_ID,
   videoModeLabel,
   videoRatioLabel,
+  videoRatioForSize,
   videoResolutionLabel,
   type LocalModelConfig,
+  type OpenjutsuMode,
+  type OpenjutsuPromptApi,
   type VideoMode,
   type VideoModel,
   type VideoResolution,
 } from "../lib/video";
 import type { StudioPlan } from "../lib/studio";
+import { CANCELLED_MESSAGE, isSamplerProgress } from "../lib/render-progress";
+import { formatTimingSummary, readTiming } from "../lib/render-timing";
 import {
-  FRAME_SIZE,
   MAX_FRAMES,
+  canContinueFrame,
   clipSeconds,
+  fitFrameBox,
   frameBounds,
+  frameBox,
+  frameOffset,
+  frameRect,
+  frameTitle,
+  frameVideoModel,
   isVideoSrc,
   nextPosition,
   normalizeName,
+  ratioValue,
   relativeTime,
   type Frame,
   type FrameRecipe,
@@ -89,17 +125,26 @@ import {
   writePanelSettings,
   type PanelTab,
 } from "../lib/panel-settings";
+import {
+  fitView,
+  readCanvasView,
+  recenter,
+  writeCanvasView,
+  zoomAt,
+  type View,
+} from "../lib/canvas-view";
 
-const MIN_ZOOM = 0.1;
-const MAX_ZOOM = 2;
+/** How long a pan or a zoom settles before the view is written back. */
+const VIEW_SAVE_DELAY = 300;
 const SAVE_DELAY = 600;
+/** How long the panel's one-line asides ("Continuing this clip.") stay up. */
+const NOTICE_MS = 4000;
 const BRAIN_KEY = "cinematic.brain";
 
 /** The enhancers the Flavor picker lists, in the order `FLAVOR_BRAINS` sets. */
 const FLAVOR_MODELS = FLAVOR_BRAINS.map((id) =>
   BRAIN_OPTIONS.find((option) => option.id === id),
 ).filter((option): option is BrainOption => Boolean(option));
-const MAX_CHARACTERS = 3;
 
 /** `anthropic/claude-opus-5-5` → `Opus 5.5`, for the viewer's settings row. */
 function flavorLabel(id: string) {
@@ -158,7 +203,6 @@ async function referenceFromSrc(src: string): Promise<Reference | undefined> {
   }
 }
 
-type View = { x: number; y: number; zoom: number };
 type Tool = "select" | "hand";
 type Snapshot = { frames: Frame[]; messages: Message[] };
 type SaveState = "idle" | "saving" | "saved" | "error";
@@ -168,17 +212,37 @@ type SaveState = "idle" | "saving" | "saved" | "error";
  * The slot is picked before the request goes out, so the work lands in its own
  * space and a second render cannot claim it while this one is still running.
  */
-type PendingRender = { id: string; x: number; y: number; kind: "image" | "video"; prompt: string };
+type PendingRender = {
+  id: string;
+  x: number;
+  y: number;
+  kind: "image" | "video";
+  prompt: string;
+  /**
+   * The shape the render is heading for, when the panel knows one.
+   *
+   * A slot wears the shape of the frame it will become, so the finished render
+   * replaces the tile that was on screen instead of changing its body. A route
+   * that decides its own shape (an edited canvas, Auto) leaves this out and
+   * the slot stays the square the grid reserved.
+   */
+  aspect?: number;
+  /** The request this slot waits on, when it is not the slot's own id (a still batch shares one). */
+  renderId?: string;
+};
 
 /** What `/api/video/progress` says about one clip in flight. */
-type RenderTrack = { label: string; stage: string; step?: number; steps?: number; elapsed: number };
+type RenderTrack = { label: string; stage: string; step?: number; steps?: number; node?: string; elapsed: number };
 
 /** How far up the tile's fill sits for a report, or undefined to keep the timed climb. */
 function trackFraction(track: RenderTrack | undefined) {
   if (!track) return undefined;
   if (track.stage === "downloading") return 0.96;
-  // Sampling is nearly all of a local clip's time, so the steps carry the bar.
-  if (track.step !== undefined && track.steps) return 0.06 + 0.88 * Math.min(1, track.step / track.steps);
+  // Sampling is nearly all of a local clip's time, so a sampler's steps carry
+  // the bar; another node's counter (VHS counting frames) does not.
+  if (track.step !== undefined && track.steps && isSamplerProgress(track)) {
+    return 0.06 + 0.88 * Math.min(1, track.step / track.steps);
+  }
   if (track.stage === "rewriting" || track.stage === "uploading" || track.stage === "queued") return 0.03;
   return undefined;
 }
@@ -218,19 +282,24 @@ function claimInFlight(projectId: string, slots: PendingRender[]) {
   inFlightRenders.set(projectId, [...(inFlightRenders.get(projectId) ?? []), ...slots]);
 }
 
-/** Drop slots a render finished with — successfully or not — from the copy. */
-function releaseInFlight(projectId: string, ids: string[]) {
+/**
+ * Drop slots a render finished with — successfully or not — from the copy.
+ *
+ * `keepSaved` leaves the browser's saved record alone: a request that never
+ * got an answer may have been cut off by a reload, and that record is what
+ * lets the next page collect the clip the server is still rendering.
+ */
+function releaseInFlight(projectId: string, ids: string[], keepSaved = false) {
   const remaining = inFlightRenders.get(projectId)?.filter((slot) => !ids.includes(slot.id));
   if (remaining?.length) inFlightRenders.set(projectId, remaining);
   else inFlightRenders.delete(projectId);
-  forgetClips(ids);
+  if (!keepSaved) forgetClips(ids);
 }
 
 /** Everything a clip's frame records besides what the server answers. */
 type ClipMeta = {
   /** What the person typed; may be empty in a reference mode. */
   value: string;
-  caption: string;
   mode: VideoMode;
   model: string;
   ratio: string;
@@ -239,6 +308,10 @@ type ClipMeta = {
   brain: string | null;
   characterSrcs: string[];
   backgroundSrc?: string;
+  /** The library entry the reference clip came from, so Reuse can attach it again. */
+  clip?: string;
+  /** Seconds into that clip where the trim window starts. */
+  start?: number;
 };
 
 /** A clip in flight, as written to the browser so a reload can pick it up. */
@@ -254,8 +327,8 @@ type SavedClip = { projectId: string; slot: PendingRender; meta: ClipMeta; start
  * still takes seconds and is not worth this; only clips are saved.
  */
 const SAVED_CLIPS_KEY = "cinematic.inflight";
-/** Past this the server has forgotten the render anyway. */
-const SAVED_CLIP_TTL_MS = 30 * 60_000;
+/** Longer than the slowest route (Openjutsu Prime's 35 minutes, 40 with its uploads and download). */
+const SAVED_CLIP_TTL_MS = 45 * 60_000;
 
 function readSavedClips(): SavedClip[] {
   try {
@@ -303,9 +376,13 @@ async function clipFrame(
   return {
     id,
     src: storedSrc,
-    prompt: data.prompt?.trim() || meta.caption,
-    // An empty prompt stays empty: the caption labels the frame, it is not
-    // something the person typed, and a reuse must not hand it back as one.
+    // What the model was handed, and nothing else. A reference render can run
+    // with no words at all, so the route's empty answer stays empty: the caption
+    // the panel once stored here made a clip's name read "Video Reference
+    // reference", and `frameTitle` names such a clip after its mode instead.
+    prompt: data.prompt?.trim() ?? "",
+    // What the person typed. A reference render needs no words, so the reuse
+    // box comes back empty rather than holding a label as if it were typed.
     sourcePrompt: (data.sourcePrompt ?? meta.value).trim(),
     enhanced: data.enhanced === true,
     // A reference mode rewrites unconditionally, so it has no enhancer to
@@ -322,6 +399,8 @@ async function clipFrame(
         ratio: meta.ratio,
         resolution: meta.resolution,
         duration: meta.duration,
+        ...(meta.clip ? { clip: meta.clip } : {}),
+        ...(meta.start ? { start: meta.start } : {}),
       },
     },
     characterSrcs: meta.characterSrcs,
@@ -337,13 +416,141 @@ async function clipFrame(
 }
 
 /** The canvas log line for a finished clip. */
-function clipMessage(meta: ClipMeta, frame: Frame): Message {
+function clipMessage(meta: ClipMeta, frame: Frame, timing?: unknown): Message {
+  const text = meta.value
+    ? `Clip · ${videoModeLabel(meta.mode)}: ${frame.prompt}`
+    : `Clip · ${videoModeLabel(meta.mode)}`;
+  // A local render says where its time went.
+  const segments = readTiming(timing);
   return {
     id: crypto.randomUUID(),
     role: "assistant",
-    text: meta.value
-      ? `Clip · ${videoModeLabel(meta.mode)}: ${frame.prompt}`
-      : `Clip · ${videoModeLabel(meta.mode)}`,
+    text: segments ? `${text}\n${formatTimingSummary(segments)}` : text,
+    createdAt: Date.now(),
+  };
+}
+
+/** Everything a still batch's frames record besides what the server answers. */
+type StillMeta = {
+  value: string;
+  canvas: boolean;
+  brain: string | null;
+  image: string;
+  ratio: string;
+  resolution: ImageResolution;
+  batch: number;
+  canvasSrc?: string;
+  referenceSrcs: string[];
+};
+
+/** What `/api/harness` answers for a render. */
+type StillAnswer = {
+  src?: string;
+  srcs?: string[];
+  prompt?: string;
+  sourcePrompt?: string;
+  enhanced?: boolean;
+  route?: { tool?: { model?: string; aspectRatio?: string; resolution?: string } };
+};
+
+/**
+ * A still render in flight, saved like a clip so a reload can collect it.
+ * One request makes the whole batch, so the batch shares one render id.
+ */
+type SavedStill = { projectId: string; renderId: string; slots: PendingRender[]; meta: StillMeta; startedAt: number };
+
+const SAVED_STILLS_KEY = "cinematic.inflight-stills";
+
+function readSavedStills(): SavedStill[] {
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(SAVED_STILLS_KEY) ?? "[]");
+    if (!Array.isArray(parsed)) return [];
+    const now = Date.now();
+    return (parsed as SavedStill[]).filter(
+      (still) =>
+        still && typeof still.renderId === "string" && Array.isArray(still.slots) && now - Number(still.startedAt) < SAVED_CLIP_TTL_MS,
+    );
+  } catch {
+    return [];
+  }
+}
+
+function writeSavedStills(stills: SavedStill[]) {
+  try {
+    if (stills.length) window.localStorage.setItem(SAVED_STILLS_KEY, JSON.stringify(stills));
+    else window.localStorage.removeItem(SAVED_STILLS_KEY);
+  } catch {
+    // Storage is full or blocked: the batch still lands unless the page reloads.
+  }
+}
+
+function saveStill(still: SavedStill) {
+  writeSavedStills([...readSavedStills().filter((saved) => saved.renderId !== still.renderId), still]);
+}
+
+function forgetStills(renderIds: string[]) {
+  const saved = readSavedStills();
+  const kept = saved.filter((still) => !renderIds.includes(still.renderId));
+  if (kept.length !== saved.length) writeSavedStills(kept);
+}
+
+/** Saved batches being collected right now, so a remount never collects twice. */
+const resumingStills = new Set<string>();
+
+/** The frames a finished batch becomes, one per claimed slot, where each now sits. */
+async function stillFrames(
+  data: StillAnswer,
+  meta: StillMeta,
+  slots: readonly { id: string; x: number; y: number }[],
+  placedAt: (id: string) => { x: number; y: number } | undefined,
+): Promise<Frame[]> {
+  const sources = data.srcs?.length ? data.srcs : data.src ? [data.src] : [];
+  if (sources.length === 0) throw new Error("The render did not return an image.");
+  // The route answers with the bytes; this browser keeps them, so a frame
+  // outlives the tab without anything being stored on the server.
+  const stored = await Promise.all(sources.map((src) => putDataUrl(src, "render.png")));
+  return stored.map((src, index) => {
+    const slot = slots[index];
+    const placed = slot ? placedAt(slot.id) : undefined;
+    return {
+      id: slot?.id ?? crypto.randomUUID(),
+      src,
+      prompt: data.prompt ?? meta.value,
+      sourcePrompt: data.sourcePrompt ?? meta.value,
+      enhanced: data.enhanced === true,
+      // The whole call, so Reuse can make it again and the viewer can say
+      // which size and enhancer produced this frame.
+      recipe: {
+        tab: "create",
+        flavor: meta.canvas ? null : meta.brain,
+        image: meta.image,
+        ratio: data.route?.tool?.aspectRatio ?? meta.ratio,
+        resolution: data.route?.tool?.resolution ?? meta.resolution,
+        batch: meta.batch,
+        ...(meta.canvas ? { canvas: true } : {}),
+      },
+      characterSrcs: [],
+      referenceSrcs: meta.referenceSrcs,
+      canvasSrc: meta.canvasSrc,
+      media: "image",
+      style: "none",
+      model: data.route?.tool?.model ?? meta.image,
+      x: placed?.x ?? slot?.x ?? 0,
+      y: placed?.y ?? slot?.y ?? 0,
+      createdAt: Date.now(),
+    };
+  });
+}
+
+/** The canvas log line for a finished batch. */
+function stillMessage(meta: StillMeta, frames: Frame[], enhanced: boolean): Message {
+  const first = frames[0]!;
+  return {
+    id: crypto.randomUUID(),
+    role: "assistant",
+    text:
+      `${meta.canvas ? "Edited" : enhanced ? "Enhanced prompt" : "Rendered"}: ${first.prompt}` +
+      (frames.length > 1 ? ` (${frames.length} images)` : ""),
     createdAt: Date.now(),
   };
 }
@@ -369,8 +576,6 @@ const PICKER_COPY: Record<PickerTarget["slot"], string> = {
   audio: "Audio reference",
   clip: "Video reference",
 };
-
-const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
 /**
  * Capture the pointer, tolerating one that is no longer active.
@@ -481,6 +686,13 @@ type ReferenceSlotProps = {
   onChange: (value: Reference | undefined) => void;
   /** Opens the asset picker instead of the OS file dialog. */
   onPick: () => void;
+  /**
+   * When set, clicking a filled slot calls this (e.g. to put `<image1>` in the
+   * prompt) and only its ✕ removes it.
+   */
+  onTag?: () => void;
+  /** What a click on the filled slot does, for its tooltip. */
+  tagTitle?: string;
 };
 
 const REFERENCE_GLYPH: Record<ReferenceSlotProps["kind"], React.ReactNode> = {
@@ -513,10 +725,42 @@ const REFERENCE_TITLE: Record<ReferenceSlotProps["kind"], string> = {
 };
 
 /** One upload slot: empty shows a dashed tile, filled shows the image. */
-function ReferenceSlot({ kind, value, disabled, onChange, onPick }: ReferenceSlotProps) {
+function ReferenceSlot({ kind, value, disabled, onChange, onPick, onTag, tagTitle }: ReferenceSlotProps) {
   const noun = REFERENCE_TITLE[kind];
   const title = kind === "reference" ? "Add a reference image" : `Add a ${noun} reference`;
   const removeTitle = kind === "reference" ? "Remove reference image" : `Remove ${noun} reference`;
+
+  // Two sibling buttons rather than one inside the other: the image tags, the
+  // ✕ removes.
+  if (value && onTag) {
+    return (
+      <span className={`reference-slot is-${kind}`}>
+        <button
+          type="button"
+          className={`reference-thumb is-${kind}`}
+          onClick={onTag}
+          title={tagTitle}
+          aria-label={tagTitle}
+          disabled={disabled}
+        >
+          <img src={value.preview} alt="" />
+          <span className="reference-kind" aria-hidden="true">
+            {REFERENCE_GLYPH[kind]}
+          </span>
+        </button>
+        <button
+          type="button"
+          className="reference-x"
+          onClick={() => onChange(undefined)}
+          title={removeTitle}
+          aria-label={removeTitle}
+          disabled={disabled}
+        >
+          ✕
+        </button>
+      </span>
+    );
+  }
 
   if (value) {
     return (
@@ -658,6 +902,37 @@ function MediaSlot({
   );
 }
 
+/**
+ * The part of the canvas the floating chrome does not cover.
+ *
+ * Fitting into this box is what puts a board in the middle of the space a
+ * person can actually see: the left rail and the top strip on desktop, the
+ * top strip above the sheet on a phone.
+ */
+function fitBox(width: number, height: number) {
+  return width <= 900
+    ? { x: 0, y: 0, width, height: Math.max(220, height * 0.46) }
+    : { x: 372, y: 76, width: Math.max(240, width - 372 - 24), height: Math.max(240, height - 164) };
+}
+
+function fitPadding(width: number) {
+  return width <= 900 ? 28 : 48;
+}
+
+/**
+ * The Openjutsu gear's Extras, as [field, label, default]: the second pass's
+ * checkpoint and LoRA and the upscale pass's two files, each filled in with
+ * its default. A field left at its default is not saved (see `saveLocalConfig`).
+ */
+const OPENJUTSU_EXTRAS = [
+  ["ref2vaUnet", "Second pass model", REF2VA_UNET_DEFAULT],
+  ["ref2vaLora", "Second pass LoRA", REF2VA_LORA_DEFAULT],
+  ["latentUpscaler", "Latent upscaler", REF5_UPSCALER_DEFAULT],
+  ["refinerLora", "Refiner LoRA", OPENJUTSU_REFINER_LORAS[0]],
+] as const;
+
+type ExtrasKey = (typeof OPENJUTSU_EXTRAS)[number][0];
+
 export function ProjectWorkspace({ projectId }: { projectId: string }) {
   // Frames, tiles and previews re-render as their blobs come back from
   // IndexedDB; the first pass paints placeholders.
@@ -687,16 +962,60 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
   const [imageReferences, setImageReferences] = useState<Reference[]>([]);
 
   const [videoPrompt, setVideoPrompt] = useState("");
+  /** ref5 only: whether the user writes the edit, or leaves it to the graph. */
+  const [ref5Prompt, setRef5Prompt] = useState(false);
+  const videoPromptRef = useRef<HTMLTextAreaElement>(null);
+  /** The H3 tier last picked in the card's toggle; the card picks it again. */
+  const [h3Tier, setH3Tier] = useState<string>();
   const [videoModel, setVideoModel] = useState<string>(DEFAULT_VIDEO_MODEL.id);
   const [videoRatio, setVideoRatio] = useState<string>(DEFAULT_VIDEO_MODEL.ratio);
   const [videoResolution, setVideoResolution] = useState<VideoResolution>(DEFAULT_VIDEO_MODEL.resolution);
   const [videoModelOpen, setVideoModelOpen] = useState(false);
   const [videoDuration, setVideoDuration] = useState<number>(DEFAULT_VIDEO_MODEL.duration);
   const [trimOpen, setTrimOpen] = useState(false);
-  const [videoMode, setVideoMode] = useState<VideoMode>("free");
+  // The default model's own first mode: Openjutsu has only Video Reference,
+  // while the H3 entries start on Free.
+  const [videoMode, setVideoMode] = useState<VideoMode>(DEFAULT_VIDEO_MODEL.modes[0] ?? "free");
   const [localConfig, setLocalConfig] = useState<LocalModelConfig | null>(null);
-  const [localConfigOpen, setLocalConfigOpen] = useState(false);
-  const [localDraft, setLocalDraft] = useState({ unet: "", clip: "", steps: "", refVideoEdge: "0" });
+  /** Openjutsu's own settings; it no longer shares MiniMax H3 Local's. */
+  const [openjutsuConfig, setOpenjutsuConfig] = useState<LocalModelConfig | null>(null);
+  /** Which local video row's gear is open; each edits its own settings. */
+  const [localConfigTarget, setLocalConfigTarget] = useState<"local" | "openjutsu" | null>(null);
+  const [localDraft, setLocalDraft] = useState<{
+    unet: string;
+    clip: string;
+    steps: string;
+    refVideoEdge: string;
+    openRouterKey: string;
+    openjutsuMode: OpenjutsuMode;
+    /** Openjutsu: which API its prompt model is called through. */
+    promptApi: OpenjutsuPromptApi;
+    /** MiniMax H3 Local: the reference rewrite model, as `provider/model/thinking`. */
+    promptModel: string;
+    /** Extras: whether the 2x upscale pass runs (off by default). */
+    upscale: boolean;
+    /** Extras, filled in with the defaults; Verify swaps in the refiner rank the target has. */
+    ref2vaUnet: string;
+    ref2vaLora: string;
+    latentUpscaler: string;
+    refinerLora: string;
+  }>({
+    unet: "",
+    clip: "",
+    steps: "",
+    refVideoEdge: "0",
+    openRouterKey: "",
+    openjutsuMode: OPENJUTSU_DEFAULTS.mode,
+    promptApi: OPENJUTSU_DEFAULTS.promptApi,
+    promptModel: REFERENCE_PROMPT_SPEC,
+    upscale: OPENJUTSU_DEFAULTS.upscale,
+    ref2vaUnet: REF2VA_UNET_DEFAULT,
+    ref2vaLora: REF2VA_LORA_DEFAULT,
+    latentUpscaler: REF5_UPSCALER_DEFAULT,
+    refinerLora: OPENJUTSU_REFINER_LORAS[0],
+  });
+  /** Whether the Openjutsu gear shows its Extras fields. */
+  const [extrasOpen, setExtrasOpen] = useState(false);
   const [localBusy, setLocalBusy] = useState(false);
   const [localError, setLocalError] = useState<string>();
   const [verifying, setVerifying] = useState(false);
@@ -705,11 +1024,20 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     host?: string;
     unet?: { name: string; found?: boolean };
     clip?: { name: string; found?: boolean };
+    /** Openjutsu: the other files its graph loads; `key` is the Extras field each belongs to. */
+    files?: { key: ExtrasKey; label: string; name: string; found?: boolean }[];
     note?: string;
     error?: string;
   } | null>(null);
   const [audioRef, setAudioRef] = useState<MediaFile>();
   const [clipRef, setClipRef] = useState<MediaFile>();
+  /** The library entry `clipRef` came from, so Reuse can attach it again. */
+  const [clipAssetId, setClipAssetId] = useState<string>();
+  /**
+   * Where the trim window starts in `clipRef`, in seconds. The ref5 graph cuts
+   * from there; every model records it so Reuse opens the same window.
+   */
+  const [clipStart, setClipStart] = useState(0);
   /**
    * The clip a Continue was armed from.
    *
@@ -723,10 +1051,23 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
   const [picker, setPicker] = useState<PickerTarget | null>(null);
   const [uploads, setUploads] = useState<Asset[]>([]);
   const [liked, setLiked] = useState<string[]>([]);
+  /**
+   * A model call is in flight.
+   *
+   * It locks the Generate buttons — one render at a time — and nothing else.
+   * A render captures everything it needs when it starts, so the panel stays
+   * usable while it runs: the next prompt, model, shape or reference can be
+   * set up without waiting for the current one to land. The chat's Send is
+   * the one other action held, because it is a model call of its own.
+   */
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string>();
   const [failed, setFailed] = useState(false);
+  /** Set when Openjutsu's prompt model answered blank twice; shown as a popup. */
+  const [blankPromptError, setBlankPromptError] = useState<string>();
   const [selected, setSelected] = useState<string | null>(null);
+  /** The rendering tile that was clicked, which shows its ✕ until clicked away. */
+  const [armedPending, setArmedPending] = useState<string | null>(null);
   /** Renders in flight, each holding a slot on the canvas. */
   const [pending, setPending] = useState<PendingRender[]>([]);
   /** The same slots, readable from a callback that resolves after a render. */
@@ -772,6 +1113,8 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
   const [narrow, setNarrow] = useState(false);
   /** Clip settings a reuse is about to restore, so the model effect leaves them alone. */
   const pendingRestore = useRef<ClipRestore | null>(null);
+  /** The video model the panel was last on, so the effect can tell a switch. */
+  const lastVideoModel = useRef(DEFAULT_VIDEO_MODEL.id);
   /** Still settings a saved panel is about to restore, so the image effect leaves them alone. */
   const restoreImage = useRef<{
     model: string;
@@ -788,6 +1131,10 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
    */
   const continuePrior = useRef<{
     clip?: MediaFile;
+    /** The library id that clip came from, restored with it. */
+    clipAssetId?: string;
+    /** The trim window start to put back with the clip. */
+    start?: number;
     prompt: string;
     characters: Reference[];
     background?: Reference;
@@ -797,8 +1144,36 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
   const selectionBarRef = useRef<HTMLDivElement>(null);
   /** Where the selection bar sits, in canvas pixels. Null until measured. */
   const [barPos, setBarPos] = useState<{ left: number; top: number } | null>(null);
+  /**
+   * Shapes measured off the media itself, by frame id.
+   *
+   * A tile is drawn at its media's own shape, and the file is the only thing
+   * that knows it for certain: a local render can come back in a different
+   * shape than the panel asked for. Until the blob loads, the frame's recipe
+   * holds the tile at the shape that was asked for.
+   */
+  const [frameRatios, setFrameRatios] = useState<Record<string, number>>({});
+  const rememberRatio = useCallback((id: string, width: number, height: number) => {
+    if (!(width > 0) || !(height > 0)) return;
+    const ratio = width / height;
+    setFrameRatios((current) => {
+      const previous = current[id];
+      // A load can fire again for the same blob; only a different shape is news.
+      return previous !== undefined && Math.abs(previous - ratio) < 0.001 ? current : { ...current, [id]: ratio };
+    });
+  }, []);
   const deleteTimer = useRef(0);
   const viewRef = useRef<View>(view);
+  /**
+   * True once the project's own view is on screen.
+   *
+   * The first render paints the default view; the load effect then restores
+   * the stored one, or fits. Writing before that would store the default on
+   * top of the view the person left.
+   */
+  const viewReady = useRef(false);
+  /** A fit asked for before the canvas had a size, honoured on first measure. */
+  const pendingFit = useRef<Frame[] | null>(null);
   const projectRef = useRef<Project | null>(null);
   const skipSave = useRef(true);
   const spaceHeld = useRef(false);
@@ -844,10 +1219,22 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     projectRef.current = project;
   }, [project]);
 
+  /**
+   * Panel notices are asides about a press that just happened ("Continuing
+   * this clip."), not status. They clear themselves, or one would sit under
+   * the buttons until some later action happened to replace it.
+   */
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(undefined), NOTICE_MS);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
   // A clip's request only answers at the end, so its tile asks the server how
   // far the render has got. A 404 just means no stage yet (or already done):
   // the tile keeps its last word rather than flickering back.
-  const clipSlots = pending.filter((slot) => slot.kind === "video").map((slot) => slot.id).join(",");
+  // One poll per request: a still batch's slots share their render's record.
+  const clipSlots = [...new Set(pending.map((slot) => slot.renderId ?? slot.id))].join(",");
   useEffect(() => {
     if (!clipSlots) {
       setTracks({});
@@ -893,24 +1280,28 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     const orphans = readSavedClips().filter(
       (clip) => clip.projectId === projectId && !live.some((slot) => slot.id === clip.slot.id),
     );
-    setPending([...live, ...orphans.map((clip) => clip.slot)]);
+    // Still batches come back the same way, every slot of the batch at once.
+    const orphanStills = readSavedStills().filter(
+      (still) => still.projectId === projectId && !live.some((slot) => slot.renderId === still.renderId),
+    );
+    setPending([...live, ...orphans.map((clip) => clip.slot), ...orphanStills.flatMap((still) => still.slots)]);
     for (const clip of orphans) void resumeClip(clip);
+    for (const still of orphanStills) void resumeStill(still);
     // resumeClip reads only refs and setters, so the project id is the only trigger.
   }, [projectId]);
 
   /**
-   * Apply a project update from code that may outlive the workspace.
+   * Apply a finished render to the project, and store it before returning.
    *
    * A render keeps running after the canvas unmounts, and a state update on an
-   * unmounted component is silently dropped — so when the workspace is gone
-   * the same change is written to the store directly, which is where the next
-   * mount reads from.
+   * unmounted component is silently dropped — so the change is always written
+   * to the store directly, which is where the next mount reads from. That
+   * includes a mounted canvas: its own save waits `SAVE_DELAY`, and the
+   * caller drops the in-flight record and the server's copy as soon as this
+   * returns, so a reload in that gap would otherwise lose the result outright.
    */
   async function applyProjectUpdate(mutate: (project: Project) => Project) {
-    if (mountedRef.current) {
-      setProject((current) => (current ? mutate(current) : current));
-      return;
-    }
+    if (mountedRef.current) setProject((current) => (current ? mutate(current) : current));
     try {
       const current = await readProject(projectId);
       if (current) await writeProject(mutate(current));
@@ -926,35 +1317,28 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     if (!element) return;
     const width = element.clientWidth;
     const height = element.clientHeight;
-    const narrow = width <= 900;
 
-    // Fit into the part of the canvas that floating chrome does not cover:
-    // the left rail on desktop, the top strip above the sheet on mobile.
-    const box = narrow
-      ? { x: 0, y: 0, w: width, h: Math.max(220, height * 0.46) }
-      : { x: 372, y: 76, w: Math.max(240, width - 372 - 24), h: Math.max(240, height - 164) };
-    const padding = narrow ? 28 : 48;
-
-    if (frames.length === 0) {
-      setView({ x: box.x + box.w / 2, y: box.y + box.h / 2, zoom: 1 });
+    // A canvas that has not been laid out yet — a hidden tab, a first paint —
+    // has nothing to fit into. The resize observer honours the fit the moment
+    // it has a size, rather than framing the board against a 0x0 box.
+    if (width < 2 || height < 2) {
+      pendingFit.current = frames;
       return;
     }
 
-    const bounds = frameBounds(frames);
-    const zoom = clamp(
-      Math.min(1, Math.min((box.w - padding * 2) / bounds.width, (box.h - padding * 2) / bounds.height)),
-      MIN_ZOOM,
-      1,
-    );
-    setView({
-      zoom,
-      x: box.x + box.w / 2 - (bounds.x + bounds.width / 2) * zoom,
-      y: box.y + box.h / 2 - (bounds.y + bounds.height / 2) * zoom,
-    });
+    pendingFit.current = null;
+    // An empty canvas frames the square the first result will fill (the
+    // origin, at full size), so its tile lands in the middle, not below and
+    // to the right of it.
+    setView(fitView(frameBounds(frames), fitBox(width, height), fitPadding(width)));
   }, []);
 
   useEffect(() => {
     let alive = true;
+    // A different project has a different view: nothing may be written until
+    // this one has been read, and a fit aimed at the last one is dropped.
+    viewReady.current = false;
+    pendingFit.current = null;
     (async () => {
       try {
         const project = await readProject(projectId);
@@ -968,7 +1352,14 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         setUploads(project.assets.map((asset) => ({ ...asset, origin: "upload" as const })));
         setLiked(project.saved);
         skipSave.current = true;
-        requestAnimationFrame(() => fit(project.frames));
+
+        // Reopen the board where it was left, the way ComfyUI reopens a
+        // workflow with its own offset and scale. Only a project with no
+        // stored view is fitted, and never on top of a restored one.
+        const stored = readCanvasView(window.localStorage, projectId);
+        if (stored) setView(stored);
+        else requestAnimationFrame(() => fit(project.frames));
+        viewReady.current = true;
       } catch {
         if (alive) setLoadError("Could not read the project from this browser.");
       }
@@ -1013,6 +1404,29 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     return () => window.clearTimeout(timer);
   }, [project, uploads, liked]);
 
+  // The view belongs to the project: a pan or a zoom is written back so the
+  // next visit opens exactly here. Debounced because a drag or a wheel fires
+  // many times a second, and skipped until the load effect has settled the
+  // view, so the default never lands on top of a stored one.
+  useEffect(() => {
+    if (!viewReady.current) return;
+    const timer = window.setTimeout(() => writeCanvasView(window.localStorage, projectId, view), VIEW_SAVE_DELAY);
+    return () => window.clearTimeout(timer);
+  }, [view, projectId]);
+
+  // A reload can cut that debounce short, so the last frame of a pan is
+  // written on the way out rather than lost.
+  useEffect(() => {
+    const flush = () => {
+      if (viewReady.current) writeCanvasView(window.localStorage, projectId, viewRef.current);
+    };
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      flush();
+    };
+  }, [projectId]);
+
   /**
    * Put a clip's own settings back, filling in only what the frame recorded.
    *
@@ -1026,15 +1440,33 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         ? (want.mode as VideoMode)
         : model.modes.includes(videoMode)
           ? videoMode
-          : "free",
+          : // Openjutsu only has Video Reference, so "free" is not a given.
+            (model.modes[0] ?? "free"),
     );
     setVideoRatio(findVideoRatio(want.ratio, model.ratio, model.ratios).id);
     setVideoResolution(findVideoResolution(want.resolution, model.resolution, model.resolutions));
     setVideoDuration((current) => clampDuration(want.duration ?? current, model));
   }
 
+  /**
+   * Leave Continue from an effect, which cannot read the render's own state.
+   *
+   * The model effect ends a continuation a newly picked model cannot render.
+   * Depending on `continuation` there instead would re-run that effect — and
+   * reset the panel's shape and size — every time one is armed or left.
+   */
+  const leaveContinuationRef = useRef(leaveContinuation);
+  leaveContinuationRef.current = leaveContinuation;
+
   useEffect(() => {
     const model = findVideoModel(videoModel) ?? DEFAULT_VIDEO_MODEL;
+    const previous = findVideoModel(lastVideoModel.current);
+    lastVideoModel.current = model.id;
+
+    // A model that cannot continue ends the continuation: its tab has no
+    // render to offer, so leaving it armed would strand the panel on a clip
+    // only Openjutsu's entry could carry. The parked reference comes back.
+    if (!supportsContinuation(model)) leaveContinuationRef.current();
 
     // A reuse has already put the clip's own size and timing back; resetting
     // them to the model's defaults here is exactly what would lose them.
@@ -1049,8 +1481,15 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     setVideoRatio(model.ratio);
     setVideoResolution(model.resolution);
     // A model change drops a mode it does not offer rather than leaving a
-    // disabled button selected.
-    setVideoMode((current) => (model.modes.includes(current) ? current : "free"));
+    // disabled button selected. Leaving a one-mode model is not a choice
+    // either: Openjutsu is always Video Reference, so the next model opens on
+    // its own first mode instead of inheriting that one.
+    setVideoMode((current) => {
+      if (previous && previous.id !== model.id && previous.modes.length === 1) {
+        return model.modes[0] ?? "free";
+      }
+      return model.modes.includes(current) ? current : (model.modes[0] ?? "free");
+    });
     // A prompt-only tier cannot carry the references picked for another one.
     if (model.references === false) {
       setCharacters([]);
@@ -1059,6 +1498,8 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       setLastFrame(undefined);
       setAudioRef(undefined);
       setClipRef(undefined);
+      setClipAssetId(undefined);
+      setClipStart(0);
       setContinuation(undefined);
       continuePrior.current = null;
     }
@@ -1132,9 +1573,12 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         setVideoDuration((current) => clampDuration(saved.videoDuration ?? current, clip));
       } else {
         // The clip effect consumes this instead of resetting to the model's
-        // own defaults, exactly as a Reuse does.
+        // own defaults, exactly as a Reuse does. The panel does not store the
+        // mode, so the saved model brings its own first one rather than
+        // inheriting the default model's.
         pendingRestore.current = {
           model: clip.id,
+          mode: clip.modes[0],
           ratio: saved.videoRatio,
           resolution: saved.videoResolution,
           duration: saved.videoDuration,
@@ -1181,29 +1625,55 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
   ]);
 
   useEffect(() => {
-    // The local model names live in this browser, like the account.
-    const load = () => setLocalConfig(readSettings().localModel ?? null);
+    // Both local video configurations live in this browser, like the account.
+    const load = () => {
+      const saved = readSettings();
+      setLocalConfig(saved.localModel ?? null);
+      setOpenjutsuConfig(saved.openjutsu ?? null);
+    };
     load();
     return onSettingsChange(load);
   }, []);
 
-  function openLocalConfig() {
+  function openLocalConfig(target: "local" | "openjutsu" = "local") {
     setLocalError(undefined);
     setVerifyResult(null);
     // Nothing saved yet means the defaults are what the next render would use,
-    // so the dialog starts from those rather than from empty boxes.
-    const current = localConfig ?? LOCAL_MODEL_DEFAULTS;
+    // so the dialog starts from those rather than from empty boxes. Openjutsu
+    // used to share the local record, so that record seeds its first save.
+    const current: LocalModelConfig =
+      (target === "openjutsu" ? (openjutsuConfig ?? localConfig) : localConfig) ?? LOCAL_MODEL_DEFAULTS;
     setLocalDraft({
       unet: current.unet,
       clip: current.clip,
       steps: String(current.steps),
-      refVideoEdge: String(current.refVideoEdge),
+      // Openjutsu's caps stop at 544p, so an older, bigger pick shows as that.
+      refVideoEdge: String(
+        target === "openjutsu"
+          ? Math.min(current.refVideoEdge ?? 0, OPENJUTSU_REF_VIDEO_LIMIT)
+          : (current.refVideoEdge ?? 0),
+      ),
+      openRouterKey: current.openRouterKey ?? "",
+      openjutsuMode: current.openjutsuMode ?? OPENJUTSU_DEFAULTS.mode,
+      promptApi: current.promptApi ?? OPENJUTSU_DEFAULTS.promptApi,
+      promptModel: current.promptModel ?? REFERENCE_PROMPT_SPEC,
+      upscale: current.upscale === true,
+      ref2vaUnet: current.ref2vaUnet ?? REF2VA_UNET_DEFAULT,
+      ref2vaLora: current.ref2vaLora ?? REF2VA_LORA_DEFAULT,
+      latentUpscaler: current.latentUpscaler ?? REF5_UPSCALER_DEFAULT,
+      refinerLora: current.refinerLora ?? OPENJUTSU_REFINER_LORAS[0],
     });
     setVideoModelOpen(false);
-    setLocalConfigOpen(true);
+    setExtrasOpen(false);
+    setLocalConfigTarget(target);
   }
 
-  async function verifyLocalConfig(overrides?: { unet?: string; clip?: string }) {
+  async function verifyLocalConfig(overrides?: {
+    unet?: string;
+    clip?: string;
+    target?: "local" | "openjutsu";
+  }) {
+    const target = overrides?.target ?? localConfigTarget ?? "local";
     setVerifying(true);
     setVerifyResult(null);
     try {
@@ -1213,6 +1683,10 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         body: JSON.stringify({
           unet: (overrides?.unet ?? localDraft.unet).trim(),
           clip: (overrides?.clip ?? localDraft.clip).trim(),
+          openjutsu: target === "openjutsu",
+          ...(target === "openjutsu" && !overrides
+            ? Object.fromEntries(OPENJUTSU_EXTRAS.map(([key]) => [key, localDraft[key].trim()]))
+            : {}),
         }),
       });
       const data = (await response.json().catch(() => ({}))) as {
@@ -1220,6 +1694,8 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         host?: string;
         unet?: { name: string; found?: boolean };
         clip?: { name: string; found?: boolean };
+        files?: { key: ExtrasKey; label: string; name: string; found?: boolean }[];
+        refinerLora?: string;
         note?: string;
         error?: string;
       };
@@ -1228,6 +1704,9 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         return;
       }
       setVerifyResult(data);
+      // Either refiner rank works; keep the one this target has for Save.
+      const refinerLora = data.refinerLora;
+      if (refinerLora) setLocalDraft((current) => ({ ...current, refinerLora }));
     } catch {
       setVerifyResult({ error: "Could not reach the app server." });
     } finally {
@@ -1254,15 +1733,48 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       return;
     }
 
+    const target = localConfigTarget ?? "local";
+    // MiniMax H3 Local's reference rewrites need a model that can watch the
+    // clip, so a typo is refused here rather than failing inside a render.
+    const prompt = target === "local" ? parsePromptSpec(localDraft.promptModel) : undefined;
+    if (target === "local" && (!prompt || !acceptsVideo(prompt.brain))) {
+      setLocalError("Pick a prompt model that can watch the clip, like vertexai/gemini-3.8-flash/medium.");
+      setLocalBusy(false);
+      return;
+    }
     const config = localModelConfig({
       unet,
       clip,
       steps: Math.round(steps),
       refVideoEdge: Number(localDraft.refVideoEdge),
+      // The key belongs to Openjutsu's ref5 graph; MiniMax H3 Local never
+      // reads it, so saving that dialog leaves it out. The pipeline mode goes
+      // with it for the same reason.
+      ...(target === "openjutsu"
+        ? {
+            openRouterKey: localDraft.openRouterKey,
+            openjutsuMode: localDraft.openjutsuMode,
+            promptApi: localDraft.promptApi,
+            upscale: localDraft.upscale,
+            // An Extras name left at its default is not saved, so the
+            // H3_REF2VA_* / H3_LATENT_UPSCALER overrides still apply to it.
+            ...Object.fromEntries(
+              OPENJUTSU_EXTRAS.map(([key, , fallback]) => {
+                const name = localDraft[key].trim();
+                return [key, name === fallback ? undefined : name];
+              }),
+            ),
+          }
+        : { promptModel: localDraft.promptModel }),
     });
-    rememberLocalModel(config);
-    setLocalConfig(config);
-    setLocalConfigOpen(false);
+    if (target === "openjutsu") {
+      rememberOpenjutsu(config);
+      setOpenjutsuConfig(config);
+    } else {
+      rememberLocalModel(config);
+      setLocalConfig(config);
+    }
+    setLocalConfigTarget(null);
     setLocalBusy(false);
   }
 
@@ -1323,16 +1835,11 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     function onWheel(event: WheelEvent) {
       event.preventDefault();
       const rect = element!.getBoundingClientRect();
-      const pointerX = event.clientX - rect.left;
-      const pointerY = event.clientY - rect.top;
-      const current = viewRef.current;
-      const zoom = clamp(current.zoom * Math.exp(-event.deltaY * 0.0015), MIN_ZOOM, MAX_ZOOM);
-      const scale = zoom / current.zoom;
-      setView({
-        zoom,
-        x: pointerX - (pointerX - current.x) * scale,
-        y: pointerY - (pointerY - current.y) * scale,
-      });
+      // Zoom about the cursor, so the tile under it grows in place instead of
+      // the board sliding out from under the pointer.
+      const point = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      const factor = Math.exp(-event.deltaY * 0.0015);
+      setView((current) => zoomAt(current, factor, point));
     }
 
     element.addEventListener("wheel", onWheel, { passive: false });
@@ -1393,7 +1900,10 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     const onEmpty = event.target === event.currentTarget;
     if (tool !== "hand" && !spaceHeld.current && !onEmpty) return;
     // A press on empty canvas drops the selection, so one click clears it.
-    if (onEmpty && tool === "select" && !spaceHeld.current) setSelected(null);
+    if (onEmpty && tool === "select" && !spaceHeld.current) {
+      setSelected(null);
+      setArmedPending(null);
+    }
     capturePointer(event.currentTarget, event.pointerId);
     drag.current = {
       mode: "pan",
@@ -1407,6 +1917,10 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
 
   function startFrameDrag(event: React.PointerEvent<HTMLDivElement>, frame: Frame) {
     if (event.button !== 0) return;
+    // The hand tool belongs to the canvas: a press on a tile pans the board like
+    // a press on empty space, so nothing is selected, armed or opened while the
+    // view is being moved. Returning before stopPropagation lets startPan see it.
+    if (tool === "hand" || spaceHeld.current) return;
     event.stopPropagation();
     setSelected(frame.id);
 
@@ -1448,8 +1962,9 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
   function startPendingDrag(event: React.PointerEvent<HTMLDivElement>, slot: PendingRender) {
     if (event.button !== 0) return;
     // With the hand tool the press belongs to the canvas, which pans. Nothing
-    // is selected here, so there is no reason to swallow it first.
-    if (tool !== "select" || !project) return;
+    // is selected here, so there is no reason to swallow it first. A held space
+    // is the same gesture, so it is left to the canvas too.
+    if (tool !== "select" || spaceHeld.current || !project) return;
     event.stopPropagation();
 
     const canvas = canvasRef.current;
@@ -1521,21 +2036,20 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       setPast((history) => [...history.slice(-49), state.snapshot]);
       setFuture([]);
     }
+    // A press that barely moved was a click, not a drag: it arms the tile's ✕.
+    if (state.mode === "pending" && Math.hypot(event.clientX - state.startX, event.clientY - state.startY) < 4) {
+      setArmedPending((current) => (current === state.id ? null : state.id));
+    }
   }
 
   function zoomBy(factor: number) {
     const element = canvasRef.current;
     if (!element) return;
-    const current = viewRef.current;
-    const zoom = clamp(current.zoom * factor, MIN_ZOOM, MAX_ZOOM);
-    const scale = zoom / current.zoom;
-    const centerX = element.clientWidth / 2;
-    const centerY = element.clientHeight / 2;
-    setView({
-      zoom,
-      x: centerX - (centerX - current.x) * scale,
-      y: centerY - (centerY - current.y) * scale,
-    });
+    // Buttons zoom about the middle of the space the work occupies, not the
+    // canvas element's own middle: the rail covers part of that.
+    const box = fitBox(element.clientWidth, element.clientHeight);
+    const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    setView((current) => zoomAt(current, factor, point));
   }
 
   /* --------------------------------- actions -------------------------------- */
@@ -1656,7 +2170,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     setProject(base);
 
     // Claim one slot per image before the request goes out: each blueprint
-    // square fills while it works, and a take lands in that exact spot.
+    // tile fills while it works, and a take lands in that exact spot.
     const batch = clampImageBatch(imageBatch, activeImageModel.maxBatch);
     const claimed: { x: number; y: number }[] = [...base.frames, ...pending];
     const slots: { id: string; x: number; y: number }[] = [];
@@ -1665,16 +2179,45 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       slots.push({ id: crypto.randomUUID(), ...spot });
       claimed.push(spot);
     }
-    setPending((list) => [
-      ...list,
-      ...slots.map((slot) => ({ id: slot.id, x: slot.x, y: slot.y, kind: "image" as const, prompt: value })),
-    ]);
-    claimInFlight(
-      project.id,
-      slots.map((slot) => ({ id: slot.id, x: slot.x, y: slot.y, kind: "image" as const, prompt: value })),
-    );
+    // The batch is one request, kept under its first slot's id.
+    const renderId = slots[0]!.id;
+    // An edit follows the canvas image's shape, so that is what its slots wear;
+    // a new still wears the ratio the panel is set to.
+    const slotAspect =
+      canvasEnabled && canvasImage ? canvasImage.width / canvasImage.height : ratioValue(imageRatio);
+    const pendingSlots: PendingRender[] = slots.map((slot) => ({
+      id: slot.id,
+      x: slot.x,
+      y: slot.y,
+      kind: "image" as const,
+      prompt: value,
+      renderId,
+      aspect: slotAspect,
+    }));
+    setPending((list) => [...list, ...pendingSlots]);
+    claimInFlight(project.id, pendingSlots);
+    /** Whether the route answered at all; a reload cuts the request off unanswered. */
+    let answered = false;
 
     try {
+      // Stored before the render rather than after, so a page that reloads
+      // mid-render still has them for the frames it collects.
+      const meta: StillMeta = {
+        value,
+        canvas: canvasEnabled,
+        brain,
+        image: imageModel,
+        ratio: canvasEnabled ? "auto" : imageRatio,
+        resolution: imageResolution,
+        batch,
+        canvasSrc: canvasEnabled && canvasImage ? await putJpeg(canvasImage.base64) : undefined,
+        referenceSrcs:
+          takesImageReferences && imageReferences.length > 0
+            ? await Promise.all(imageReferences.map((item) => putJpeg(item.base64)))
+            : [],
+      };
+      saveStill({ projectId: project.id, renderId, slots: pendingSlots, meta, startedAt: Date.now() });
+
       const response = await apiFetch("/api/harness", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1691,17 +2234,13 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
           ...(takesImageReferences && imageReferences.length > 0
             ? { references: imageReferences.map((item) => item.base64) }
             : {}),
+          renderId,
         }),
       });
-      const data = (await response.json().catch(() => ({}))) as {
+      answered = true;
+      const data = (await response.json().catch(() => ({}))) as StillAnswer & {
         kind?: "answer" | "image";
         answer?: string;
-        src?: string;
-        srcs?: string[];
-        prompt?: string;
-        sourcePrompt?: string;
-        enhanced?: boolean;
-        route?: { tool?: { model?: string; aspectRatio?: string; resolution?: string } };
         error?: string;
       };
 
@@ -1719,89 +2258,31 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         );
         if (mountedRef.current) {
           setTab("chat");
-          setPrompt("");
+          setPrompt((current) => (current === value ? "" : current));
           setStatus(undefined);
         }
         return;
       }
 
-      const sources = data.srcs?.length ? data.srcs : data.src ? [data.src] : [];
-      if (sources.length === 0) throw new Error("The render did not return an image.");
-
-      // The route answers with the bytes; this browser keeps them, so a frame
-      // outlives the tab without anything being stored on the server.
-      const stored = await Promise.all(sources.map((src) => putDataUrl(src, "render.png")));
-      const canvasSrc = canvasEnabled && canvasImage ? await putJpeg(canvasImage.base64) : undefined;
-      const referenceSrcs =
-        takesImageReferences && imageReferences.length > 0
-          ? await Promise.all(imageReferences.map((item) => putJpeg(item.base64)))
-          : [];
-
       // A blueprint may have been dragged while the render ran.
-      const newFrames: Frame[] = stored.map((src, index) => {
-        const slot = slots[index];
-        const placed = slot ? pendingRef.current.find((item) => item.id === slot.id) : undefined;
-        return {
-          id: slot?.id ?? crypto.randomUUID(),
-          src,
-          prompt: data.prompt ?? value,
-          sourcePrompt: data.sourcePrompt ?? value,
-          enhanced: data.enhanced === true,
-          // The whole call, so Reuse can make it again and the viewer can say
-          // which size and enhancer produced this frame.
-          recipe: {
-            tab: "create",
-            flavor: canvasEnabled ? null : brain,
-            image: imageModel,
-            ratio: data.route?.tool?.aspectRatio ?? (canvasEnabled ? "auto" : imageRatio),
-            resolution: data.route?.tool?.resolution ?? imageResolution,
-            batch,
-            ...(canvasEnabled ? { canvas: true } : {}),
-          },
-          characterSrcs: [],
-          referenceSrcs,
-          canvasSrc,
-          media: "image",
-          style: "none",
-          model: data.route?.tool?.model ?? imageModel,
-          x: placed?.x ?? slot?.x ?? 0,
-          y: placed?.y ?? slot?.y ?? 0,
-          createdAt: Date.now(),
-        };
-      });
-
-      const first = newFrames[0]!;
-      const summary =
-        `${canvasEnabled ? "Edited" : data.enhanced ? "Enhanced prompt" : "Rendered"}: ${first.prompt}` +
-        (newFrames.length > 1 ? ` (${newFrames.length} images)` : "");
-
-      await applyProjectUpdate((current) => {
-        const frames = [...current.frames, ...newFrames].slice(0, MAX_FRAMES);
-        return {
-          ...current,
-          frames,
-          messages: [
-            ...current.messages,
-            {
-              id: crypto.randomUUID(),
-              role: "assistant" as const,
-              text: summary,
-              createdAt: Date.now(),
-            },
-          ],
-          updatedAt: Date.now(),
-        };
-      });
+      const newFrames = await stillFrames(data, meta, slots, (id) => pendingRef.current.find((item) => item.id === id));
+      await applyProjectUpdate((current) => ({
+        ...current,
+        frames: [...current.frames, ...newFrames].slice(0, MAX_FRAMES),
+        messages: [...current.messages, stillMessage(meta, newFrames, data.enhanced === true)],
+        updatedAt: Date.now(),
+      }));
 
       if (mountedRef.current) {
-        setPrompt("");
+        setPrompt((current) => (current === value ? "" : current));
         setStatus(undefined);
         setSelected(newFrames[newFrames.length - 1]!.id);
         if (base.frames.length === 0) requestAnimationFrame(() => fit(newFrames));
       }
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : "The request failed.";
-      setFailed(true);
+      // A tile's ✕ is news, not a failure.
+      setFailed(message !== CANCELLED_MESSAGE);
       setStatus(message);
       // A checkpoint the target does not have is fixed in the gear, so open it
       // with the target's real list already fetched.
@@ -1811,7 +2292,13 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       }
     } finally {
       const claimedIds = new Set(slots.map((slot) => slot.id));
-      releaseInFlight(projectId, [...claimedIds]);
+      if (answered) {
+        // The answer came straight back, so the server's kept copy can go.
+        void fetch(`/api/video/result?id=${encodeURIComponent(renderId)}`, { method: "DELETE" }).catch(() => {});
+        forgetStills([renderId]);
+      }
+      // Unanswered (a reload): the saved batch stays for the next page.
+      releaseInFlight(projectId, [...claimedIds], true);
       setPending((list) => list.filter((slot) => !claimedIds.has(slot.id)));
       setBusy(false);
     }
@@ -1907,7 +2394,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
               prompt: videoPrompt,
               video: videoModel,
               mode: videoMode,
-              ratio: videoRatio,
+              ratio: clipRenderRatio(),
               resolution: videoResolution,
               seconds: videoDuration,
             },
@@ -1955,11 +2442,27 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     }
   }
 
+  /**
+   * The shape a clip render is heading for.
+   *
+   * A motion reference decides the ratio — H3 scales its guide to the render's
+   * shape and the ref5 graph sizes itself from the clip — so the panel shows
+   * the clip's own ratio rather than whatever it was last left on. The chip is
+   * locked in video mode precisely because the clip has the last word.
+   */
+  function clipRenderRatio() {
+    if (videoMode !== "video") return videoRatio;
+    if (!clipRef?.width || !clipRef.height) return videoRatio;
+    return videoRatioForSize(clipRef.width, clipRef.height) ?? videoRatio;
+  }
+
   async function sendVideo() {
-    const value = videoPrompt.replace(/\s+/g, " ").trim();
+    // With the ref5 prompt off, whatever is in the box stays there unsent.
+    const value = ref5Auto ? "" : videoPrompt.replace(/\s+/g, " ").trim();
     // A reference mode works on the attachments alone — "replace this subject
-    // with this character" is already the whole brief.
-    if ((!value && videoMode === "free") || !project || busy) return;
+    // with this character" is already the whole brief. A ref5 prompt that is
+    // switched on is the exception: on means the user writes the edit.
+    if ((!value && (videoMode === "free" || (ref5 && !ref5Auto))) || !project || busy) return;
 
     if (videoMode === "audio" && !audioRef) {
       setFailed(true);
@@ -1971,11 +2474,22 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       setStatus("Video Reference needs a clip.");
       return;
     }
+    if (ref5 && characters.length === 0) {
+      setFailed(true);
+      setStatus("Openjutsu Prime needs at least one character to cast into the clip.");
+      return;
+    }
+    // Eight characters fit Openjutsu, not another model or a continuation.
+    if (characters.length > maxCharacters) {
+      setFailed(true);
+      setStatus(`${activeVideoModel.label} takes at most ${maxCharacters} characters here. Remove some.`);
+      return;
+    }
 
     setBusy(true);
     setFailed(false);
     setNotice(undefined);
-    setStatus("Rendering the clip… a video pass takes minutes.");
+    setStatus("Rendering the clip… this can take minutes.");
 
     // Router takes a clip, never a time range, so the tail is cut here — the
     // same re-encode the pre-upload editor uses. The local graph needs no file:
@@ -1986,13 +2500,12 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       try {
         const tail = await recordTail(clipRef.dataUrl, CONTINUATION_FRAMES);
         continuationVideo = await dataUrlFromBlob(tail);
-        setStatus("Rendering the clip… a video pass takes minutes.");
+        setStatus("Rendering the clip… this can take minutes.");
       } catch {
         // No tail to send: the rewritten prompt still carries the continuity.
       }
     }
 
-    const caption = value || `${videoModeLabel(videoMode)} reference`;
     const userMessage: Message | null = value
       ? { id: crypto.randomUUID(), role: "user", text: value, createdAt: Date.now() }
       : null;
@@ -2002,12 +2515,30 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     };
     setProject(base);
 
-    // A clip takes minutes: its square is on the canvas, filling, the whole time.
+    // A clip takes minutes: its tile is on the canvas, filling, the whole time.
     const position = nextPosition([...base.frames, ...pending]);
     const renderId = crypto.randomUUID();
-    const slot: PendingRender = { id: renderId, x: position.x, y: position.y, kind: "video", prompt: value };
+    // The slot wears the shape the panel asked for. Auto has none of its own,
+    // so a keyframe still is the closest thing to the shape that will come back.
+    const slotAspect =
+      ratioValue(clipRenderRatio()) ??
+      (firstFrame
+        ? firstFrame.width / firstFrame.height
+        : lastFrame
+          ? lastFrame.width / lastFrame.height
+          : undefined);
+    const slot: PendingRender = {
+      id: renderId,
+      x: position.x,
+      y: position.y,
+      kind: "video",
+      prompt: value,
+      aspect: slotAspect,
+    };
     setPending((list) => [...list, slot]);
     claimInFlight(project.id, [slot]);
+    /** Whether the route answered at all; see the `finally` below. */
+    let answered = false;
 
     try {
       // The stills are stored before the render rather than after, so a page
@@ -2017,15 +2548,16 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       const keyed = Boolean(firstFrame || lastFrame);
       const meta: ClipMeta = {
         value,
-        caption,
         mode: videoMode,
         model: videoModel,
-        ratio: videoRatio,
+        ratio: clipRenderRatio(),
         resolution: videoResolution,
         duration: videoDuration,
         brain,
+        ...(videoMode === "video" && clipAssetId ? { clip: clipAssetId } : {}),
+        ...(videoMode === "video" && clipStart > 0 ? { start: clipStart } : {}),
         characterSrcs: keyed ? [] : await Promise.all(characters.map((item) => putJpeg(item.base64))),
-        backgroundSrc: keyed || !background ? undefined : await putJpeg(background.base64),
+        backgroundSrc: keyed || ref5 || !background ? undefined : await putJpeg(background.base64),
       };
       saveClip({ projectId: project.id, slot, meta, startedAt: Date.now() });
 
@@ -2036,11 +2568,14 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
           prompt: value,
           mode: videoMode,
           model: videoModel,
-          ratio: videoRatio,
+          ratio: clipRenderRatio(),
           resolution: videoResolution,
           duration: videoDuration,
           characters: characters.map((item) => item.base64),
-          ...(background ? { background: background.base64 } : {}),
+          ...(background && !ref5 ? { background: background.base64 } : {}),
+          ...(ref5Auto ? { auto: true } : {}),
+          // Openjutsu cuts the trim window inside its graph, from the whole clip.
+          ...(ref5 && clipStart > 0 ? { start: clipStart } : {}),
           ...(firstFrame ? { firstFrame: firstFrame.base64 } : {}),
           ...(lastFrame ? { lastFrame: lastFrame.base64 } : {}),
           ...(audioRef ? { audio: audioRef.dataUrl } : {}),
@@ -2055,6 +2590,8 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         }),
       });
 
+      answered = true;
+
       // A route that failed before it could answer — a compile error, a
       // gateway timeout — sends an HTML page, which parses to nothing. Say
       // which status came back instead of swallowing it as "could not render".
@@ -2066,6 +2603,9 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         enhanced?: boolean;
         model?: string;
         error?: string;
+        timing?: unknown;
+        /** Set when the upscale failed and the pre-upscale clip came back. */
+        warning?: string;
       };
 
       if (!response.ok || !data.kind || !data.src) {
@@ -2079,101 +2619,159 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       await applyProjectUpdate((current) => ({
         ...current,
         frames: [...current.frames, frame].slice(0, MAX_FRAMES),
-        messages: [...current.messages, clipMessage(meta, frame)],
+        messages: [...current.messages, clipMessage(meta, frame, data.timing)],
         updatedAt: Date.now(),
       }));
 
       if (mountedRef.current) {
-        setVideoPrompt("");
+        setVideoPrompt((current) => (current === value ? "" : current));
         setStatus(undefined);
+        // The upscale failed, but the finished clip was saved before it: say
+        // so rather than passing the smaller clip off as the full render.
+        if (data.warning) setNotice(data.warning);
         setSelected(frame.id);
         if (base.frames.length === 0) requestAnimationFrame(() => fit([frame]));
       }
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : "The clip could not be rendered.";
-      setFailed(true);
+      // A tile's ✕ is news, not a failure.
+      setFailed(message !== CANCELLED_MESSAGE);
       setStatus(message);
+      if (isBlankPromptError(message)) setBlankPromptError(message);
       // A name the target does not have is fixed in the gear, so show it there
       // with the target's real checkpoint list already fetched.
       if (activeVideoModel.provider === "local" && isMissingModelError(message)) {
-        openLocalConfig();
-        void verifyLocalConfig({ unet: localConfig?.unet, clip: localConfig?.clip });
+        const target = activeVideoModel.id === OPENJUTSU_MODEL_ID ? "openjutsu" : "local";
+        const saved = target === "openjutsu" ? (openjutsuConfig ?? localConfig) : localConfig;
+        openLocalConfig(target);
+        // The dialog draft is set on the next render, so name the files the
+        // dialog will show, not whatever it held before.
+        void verifyLocalConfig({
+          unet: saved?.unet ?? LOCAL_MODEL_DEFAULTS.unet,
+          clip: saved?.clip ?? LOCAL_MODEL_DEFAULTS.clip,
+          target,
+        });
       }
     } finally {
-      // The answer came straight back, success or not, so the server's kept
-      // copy (for a page that reloaded) can go.
-      void fetch(`/api/video/result?id=${encodeURIComponent(renderId)}`, { method: "DELETE" }).catch(() => {});
-      releaseInFlight(projectId, [renderId]);
+      if (answered) {
+        // The answer came straight back, success or not, so the server's kept
+        // copy (for a page that reloaded) can go.
+        void fetch(`/api/video/result?id=${encodeURIComponent(renderId)}`, { method: "DELETE" }).catch(() => {});
+        releaseInFlight(projectId, [renderId]);
+      } else {
+        // No answer: a reload tears the request down and still runs this
+        // block on its way out. The render goes on on the server, so its saved
+        // record and kept copy stay for the next page to collect.
+        releaseInFlight(projectId, [renderId], true);
+      }
       setPending((list) => list.filter((slot) => slot.id !== renderId));
       setBusy(false);
     }
   }
 
   /**
-   * Collect a clip whose page reloaded while it rendered.
+   * Wait on a render whose page reloaded while it ran.
    *
-   * The server finished (or is still running) the render and keeps its answer
-   * under the tile id, so this waits on the tile's progress record and then
-   * takes the answer. Three misses in a row mean the server holds nothing —
-   * it restarted, or the clip is older than it keeps — and the tile goes with
-   * a message rather than spinning forever. Leaving the canvas stops the
-   * wait without forgetting the clip; the next visit picks it up again.
+   * The server finished (or is still running) it and keeps its answer under
+   * the render id, so this follows the progress record and then takes the
+   * answer. Three misses in a row mean the server holds nothing — it
+   * restarted, or the render is older than it keeps — so the caller drops the
+   * tile with a message rather than leaving it spinning. Undefined means the
+   * canvas was left: the wait stops, and the next visit picks it up again.
    */
+  async function awaitOutcome(
+    id: string,
+  ): Promise<{ state: "done"; data: unknown; ok: boolean } | { state: "failed"; error?: string } | { state: "lost" } | undefined> {
+    let misses = 0;
+    while (mountedRef.current) {
+      let stage: string | undefined;
+      let error: string | undefined;
+      try {
+        const response = await fetch(`/api/video/progress?id=${encodeURIComponent(id)}`, { cache: "no-store" });
+        if (response.ok) {
+          ({ stage, error } = (await response.json()) as { stage?: string; error?: string });
+          misses = 0;
+        } else if (response.status === 404) {
+          misses += 1;
+        }
+      } catch {
+        // The app server is down for a moment; keep waiting.
+      }
+
+      if (stage === "done") {
+        const response = await fetch(`/api/video/result?id=${encodeURIComponent(id)}`, { cache: "no-store" });
+        return { state: "done", data: await response.json().catch(() => ({})), ok: response.ok };
+      }
+      if (stage === "failed") return { state: "failed", error };
+      if (misses >= 3) return { state: "lost" };
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+    }
+    return undefined;
+  }
+
+  /**
+   * The tile's ✕: stop its render on the server.
+   *
+   * The render's own request (or a resumed wait) then ends with `Cancelled.`
+   * and takes the tile away. A server that is not running it — finished, or
+   * restarted — answers 404, so the tile and its saved record go right here.
+   */
+  async function cancelPending(slot: PendingRender) {
+    const renderId = slot.renderId ?? slot.id;
+    let known = false;
+    try {
+      const response = await fetch(`/api/render/cancel?id=${encodeURIComponent(renderId)}`, { method: "POST" });
+      known = response.ok;
+    } catch {
+      // Unreachable server: nothing is running there to stop.
+    }
+    if (known) return;
+    const gone = new Set(pending.filter((item) => (item.renderId ?? item.id) === renderId).map((item) => item.id));
+    forgetClips([renderId]);
+    forgetStills([renderId]);
+    releaseInFlight(projectId, [...gone]);
+    setPending((list) => list.filter((item) => !gone.has(item.id)));
+  }
+
+  /** Say why a resumed render ended without a result; a cancel is news, not failure. */
+  function reportUnfinished(outcome: { state: "failed"; error?: string } | { state: "lost" }, noun: string) {
+    const message =
+      outcome.state === "lost"
+        ? `A ${noun} in flight when the page reloaded could not be recovered.`
+        : (outcome.error ?? `The ${noun} could not be rendered.`);
+    setFailed(message !== CANCELLED_MESSAGE);
+    setStatus(message);
+    if (isBlankPromptError(message)) setBlankPromptError(message);
+  }
+
+  /** Collect a clip whose page reloaded while it rendered. */
   async function resumeClip(clip: SavedClip) {
     const id = clip.slot.id;
     if (resumingClips.has(id)) return;
     resumingClips.add(id);
     let settled = false;
-    let misses = 0;
     try {
-      while (mountedRef.current) {
-        let stage: string | undefined;
-        let error: string | undefined;
-        try {
-          const response = await fetch(`/api/video/progress?id=${encodeURIComponent(id)}`, { cache: "no-store" });
-          if (response.ok) {
-            ({ stage, error } = (await response.json()) as { stage?: string; error?: string });
-            misses = 0;
-          } else if (response.status === 404) {
-            misses += 1;
-          }
-        } catch {
-          // The app server is down for a moment; keep waiting.
-        }
-
-        if (stage === "done") {
-          const response = await fetch(`/api/video/result?id=${encodeURIComponent(id)}`, { cache: "no-store" });
-          const data = (await response.json().catch(() => ({}))) as Parameters<typeof clipFrame>[1] & { error?: string };
-          settled = true;
-          if (!response.ok || !data.src) {
-            setFailed(true);
-            setStatus(data.error ?? "The clip finished, but it could not be collected after the reload.");
-            break;
-          }
-          const placed = pendingRef.current.find((slot) => slot.id === id) ?? clip.slot;
-          const frame = await clipFrame(id, data, clip.meta, placed);
-          await applyProjectUpdate((current) => ({
-            ...current,
-            frames: [...current.frames, frame].slice(0, MAX_FRAMES),
-            messages: [...current.messages, clipMessage(clip.meta, frame)],
-            updatedAt: Date.now(),
-          }));
-          break;
-        }
-        if (stage === "failed") {
-          settled = true;
-          setFailed(true);
-          setStatus(error ?? "The clip could not be rendered.");
-          break;
-        }
-        if (misses >= 3) {
-          settled = true;
-          setFailed(true);
-          setStatus("A clip that was rendering before the page reloaded could not be recovered.");
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 3_000));
+      const outcome = await awaitOutcome(id);
+      if (!outcome) return;
+      settled = true;
+      if (outcome.state !== "done") {
+        reportUnfinished(outcome, "clip");
+        return;
       }
+      const data = outcome.data as Parameters<typeof clipFrame>[1] & { error?: string; timing?: unknown };
+      if (!outcome.ok || !data.src) {
+        setFailed(true);
+        setStatus(data.error ?? "The clip finished, but it could not be collected after the reload.");
+        return;
+      }
+      const placed = pendingRef.current.find((slot) => slot.id === id) ?? clip.slot;
+      const frame = await clipFrame(id, data, clip.meta, placed);
+      await applyProjectUpdate((current) => ({
+        ...current,
+        frames: [...current.frames, frame].slice(0, MAX_FRAMES),
+        messages: [...current.messages, clipMessage(clip.meta, frame, data.timing)],
+        updatedAt: Date.now(),
+      }));
     } finally {
       resumingClips.delete(id);
       if (settled) {
@@ -2183,15 +2781,58 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     }
   }
 
+  /** Collect a still batch whose page reloaded while it rendered. */
+  async function resumeStill(still: SavedStill) {
+    const id = still.renderId;
+    if (resumingStills.has(id)) return;
+    resumingStills.add(id);
+    const ids = new Set(still.slots.map((slot) => slot.id));
+    let settled = false;
+    try {
+      const outcome = await awaitOutcome(id);
+      if (!outcome) return;
+      settled = true;
+      if (outcome.state !== "done") {
+        reportUnfinished(outcome, "still");
+        return;
+      }
+      const data = outcome.data as StillAnswer & { kind?: string; error?: string };
+      if (!outcome.ok || data.kind !== "image") {
+        setFailed(true);
+        setStatus(data.error ?? "The render finished, but it could not be collected after the reload.");
+        return;
+      }
+      const frames = await stillFrames(data, still.meta, still.slots, (slotId) =>
+        pendingRef.current.find((slot) => slot.id === slotId),
+      );
+      await applyProjectUpdate((current) => ({
+        ...current,
+        frames: [...current.frames, ...frames].slice(0, MAX_FRAMES),
+        messages: [...current.messages, stillMessage(still.meta, frames, data.enhanced === true)],
+        updatedAt: Date.now(),
+      }));
+    } catch (cause) {
+      setFailed(true);
+      setStatus(cause instanceof Error ? cause.message : "The render could not be collected after the reload.");
+    } finally {
+      resumingStills.delete(id);
+      if (settled) {
+        forgetStills([id]);
+        if (mountedRef.current) setPending((list) => list.filter((slot) => !ids.has(slot.id)));
+      }
+    }
+  }
+
   /**
    * Put the panel back the way it was when this frame was made.
    *
    * The typed prompt comes back, not the rewrite: the rewrite is in the frame's
    * metadata, and re-sending it would pay for an enhancement of an enhancement.
-   * Everything else — tab, style, clip model and timing, the enhancer, and the
-   * reference stills — is restored from the recipe. A reference clip cannot be
-   * restored: only its rewrite is stored, so that mode comes back empty and
-   * says so rather than pretending it is ready.
+   * Everything else — tab, style, clip model and timing, the enhancer, the
+   * reference stills, and the reference clip with its trim window — is
+   * restored from the recipe. The clip is looked up in the library by the id
+   * the frame recorded, so one that has since been deleted stays empty rather
+   * than coming back as a stale file.
    */
   async function reuseFrame(frame: Frame, overrides?: { mode?: VideoMode }) {
     const recipe = frame.recipe;
@@ -2215,6 +2856,25 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       setTab("video");
       setVideoPrompt(typed);
       const clip = recipe?.video;
+      // The recipe is the whole panel: start the clip slot empty, then attach
+      // the reference the frame recorded, if it is still in the library.
+      setClipRef(undefined);
+      setClipAssetId(undefined);
+      setClipStart(0);
+      if (clip?.clip) {
+        const asset = findClipAsset(clip.clip);
+        if (asset) {
+          try {
+            const media = await mediaFromSrc(asset.src, asset.name, undefined, asset.seconds);
+            setClipRef(media);
+            setClipAssetId(asset.id);
+            setClipStart(clip.start ?? 0);
+          } catch {
+            // The file is gone or unreadable; the rest of the recipe still
+            // comes back.
+          }
+        }
+      }
       // A legacy clip recorded its model and length on the frame itself.
       const modelId = clip?.model ?? frame.model;
       const model = modelId ? findVideoModel(modelId) : undefined;
@@ -2233,11 +2893,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         setVideoModel(model.id);
         applyClipSettings(model, want);
       }
-      if (clip && clip.mode !== "free") {
-        setNotice("Re-attach the reference clip, then generate again.");
-      }
-      // Omitted means the mode never used an enhancer, so the button keeps
-      // whatever the person had chosen.
       if (recipe?.flavor) setBrain(recipe.flavor);
       else if (recipe?.flavor === null) setBrain(null);
     } else {
@@ -2294,6 +2949,8 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     continuePrior.current = null;
     setContinuation(undefined);
     setClipRef(prior?.clip);
+    setClipAssetId(prior?.clipAssetId);
+    setClipStart(prior?.start ?? 0);
     setVideoPrompt(prior?.prompt ?? "");
     setCharacters(prior?.characters ?? []);
     setBackground(prior?.background);
@@ -2310,13 +2967,30 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
    */
   async function continueFrame(frame: Frame) {
     if (!isVideoSrc(frame.src)) return;
+    // Continue extends a clip on the plain H3 stack. Openjutsu's ref5 graph is
+    // a cast, not a continuation, so a clip it made is never continued — and
+    // a press can never leave the panel reading "Openjutsu".
+    const source = frameVideoModel(frame);
+    if (source && !supportsContinuation(source)) {
+      setNotice(`${source.label} clips cannot be continued.`);
+      return;
+    }
     // Only the first arm parks the panel: arming a second clip is still inside
     // Continue, and the reference to go back to is the one from before it.
     // `reuseFrame` clears the parking slot on its way through, so the copy is
     // taken here and put back after it returns.
-    const prior = continuation ? null : { clip: clipRef, prompt: videoPrompt, characters, background };
+    const prior = continuation
+      ? null
+      : { clip: clipRef, clipAssetId, start: clipStart, prompt: videoPrompt, characters, background };
     await reuseFrame(frame, { mode: "video" });
     if (prior) continuePrior.current = prior;
+    // A clip that recorded no model leaves whatever was selected in place; a
+    // continuation is an H3 render, so a panel still on Openjutsu moves to the
+    // local H3 entry rather than showing a model that cannot run it.
+    if (!source && !supportsContinuation(activeVideoModel)) {
+      pendingRestore.current = { model: H3_LOCAL_MODEL_ID, mode: "video" };
+      setVideoModel(H3_LOCAL_MODEL_ID);
+    }
     setVideoMode("video");
     setContinuation({ src: frame.src });
 
@@ -2325,6 +2999,10 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       // actually going to send.
       const media = await mediaFromSrc(frame.src, `continue-${frame.id}.mp4`, undefined, frame.seconds);
       setClipRef(media);
+      // A continuation starts at the beginning of the clip it extends, not at
+      // whatever trim window the clip it was made from recorded.
+      setClipAssetId(`render:${frame.id}`);
+      setClipStart(0);
       setNotice("Continuing this clip.");
     } catch (cause) {
       setContinuation(undefined);
@@ -2358,9 +3036,11 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     const pad = 10;
     const barWidth = bar.offsetWidth;
     const barHeight = bar.offsetHeight;
-    const centerX = view.x + (selectedFrame.x + FRAME_SIZE / 2) * view.zoom;
-    const frameTop = view.y + selectedFrame.y * view.zoom;
-    const frameBottom = frameTop + FRAME_SIZE * view.zoom;
+    // The bar hugs the media, not the square slot the tile is placed in.
+    const rect = frameRect(selectedFrame, frameRatios[selectedFrame.id]);
+    const centerX = view.x + (rect.x + rect.width / 2) * view.zoom;
+    const frameTop = view.y + rect.y * view.zoom;
+    const frameBottom = frameTop + rect.height * view.zoom;
 
     // Above the frame by default; below it when there is no room at the top.
     let top = frameTop - barHeight - 12;
@@ -2377,7 +3057,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         ? current
         : { left, top },
     );
-  }, [selectedFrame, view, pendingDelete]);
+  }, [selectedFrame, view, pendingDelete, frameRatios]);
   const canUndo = past.length > 0;
   const canRedo = future.length > 0;
   const zoomLabel = useMemo(() => `${Math.round(view.zoom * 100)}%`, [view.zoom]);
@@ -2397,7 +3077,29 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
   // The H3 card switches between three Router entries; everything else is one.
   const h3Tiers = h3TierModels();
   const h3ActiveTier = h3Tiers.find((tier) => tier.model.id === videoModel);
+  // What the card shows and picks: the selected tier, else the last one picked
+  // in its toggle, else Original.
+  const h3ShownTier = h3ActiveTier ?? h3Tiers.find((tier) => tier.model.id === h3Tier) ?? h3Tiers[0]!;
+  // Openjutsu leads the picker; the other standalone entries follow the card.
+  const pinnedVideoModels = standaloneVideoModels().filter((model) => model.id === OPENJUTSU_MODEL_ID);
+  const otherVideoModels = standaloneVideoModels().filter((model) => model.id !== OPENJUTSU_MODEL_ID);
   const takesReferences = activeVideoModel.references !== false;
+  // Openjutsu (the ref5 graph) draws a sheet per character, up to eight, and
+  // takes no background: the clip is the scene. Its prompt is
+  // optional — off, the graph's own prompt model plans the edit.
+  const ref5 = isRef5Render(activeVideoModel, videoMode, Boolean(continuation));
+  const maxCharacters = maxCharacterImages(activeVideoModel, videoMode, Boolean(continuation));
+  const ref5Auto = ref5 && !ref5Prompt;
+  /** What Openjutsu still needs before it can render, or nothing. */
+  const ref5Missing = !ref5
+    ? undefined
+    : !clipRef && characters.length === 0
+      ? "Add a clip and at least one character."
+      : !clipRef
+        ? "Add the clip to cast into."
+        : characters.length === 0
+          ? "Add at least one character."
+          : undefined;
   const modeLocks = lockedByMode(videoMode);
   const unetStatus = verifyResult?.checked
     ? verifyResult.unet?.found === true
@@ -2428,6 +3130,24 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
   // Everything on the canvas is available to every slot. Frames are already
   // validated when the project loads, so this is just a projection.
   const renderAssets = useMemo(() => frames.map((frame, index) => renderAsset(frame, index)), [frames]);
+  // Stable, so the Assets tab skips the re-render this workspace does each
+  // time a blob lands.
+  const cancelPendingRef = useRef(cancelPending);
+  cancelPendingRef.current = cancelPending;
+  const cancelLibraryPending = useCallback((id: string) => {
+    const slot = pendingRef.current.find((item) => item.id === id);
+    if (slot) void cancelPendingRef.current(slot);
+  }, []);
+  const addLibraryUpload = useCallback((asset: Asset) => setUploads((current) => addUpload(current, asset)), []);
+  const toggleLibraryLike = useCallback((id: string) => setLiked((current) => toggleLiked(current, id)), []);
+  /** The library entry a stored recipe names, if it is still around. */
+  function findClipAsset(id: string) {
+    return (
+      uploads.find((asset) => asset.id === id) ??
+      renderAssets.find((asset) => asset.id === id) ??
+      SAMPLE_CLIPS.find((asset) => asset.id === id)
+    );
+  }
   /** The still the share card shows; a generated clip cannot stand in as a cover. */
   const shareCover = useMemo(() => frames.find((frame) => !isVideoSrc(frame.src))?.src, [frames]);
   /** What the Assets tab counts: every file the library can offer. */
@@ -2458,7 +3178,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       } else if (target.slot === "character") {
         setCharacters((current) =>
           target.index === null
-            ? [...current, picked.reference].slice(0, MAX_CHARACTERS)
+            ? [...current, picked.reference].slice(0, maxCharacters)
             : current.map((item, position) => (position === target.index ? picked.reference : item)),
         );
       }
@@ -2467,6 +3187,8 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       syncReferenceDuration(picked.media.seconds);
     } else {
       setClipRef(picked.media);
+      setClipAssetId(picked.asset.id);
+      setClipStart(0);
       syncReferenceDuration(picked.media.seconds);
     }
 
@@ -2479,15 +3201,30 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     setVideoDuration(clampDuration(Math.round(seconds), activeVideoModel));
   }
 
+  /**
+   * A character's tag, `<image1>` for the first, added to the end of the
+   * prompt with the caret left after it. Openjutsu on Auto has no box, so it
+   * opens one.
+   */
+  function tagCharacter(index: number) {
+    const lead = videoPrompt && !/\s$/.test(videoPrompt) ? " " : "";
+    const next = `${videoPrompt}${lead}<image${index + 1}> `;
+    if (ref5Auto) setRef5Prompt(true);
+    setVideoPrompt(next);
+    requestAnimationFrame(() => {
+      videoPromptRef.current?.focus();
+      videoPromptRef.current?.setSelectionRange(next.length, next.length);
+    });
+  }
+
   // Characters are a list: an empty slot appears after each one, up to the cap.
   const referenceStrip = (
-    <div className={`references${hasKeyframes ? " is-muted" : ""}`} title={hasKeyframes ? "Character and background references are unused while a first/last frame is set" : undefined}>
+    <div className={`references${hasKeyframes ? " is-muted" : ""}`} title={hasKeyframes ? "Unused while a keyframe is set" : undefined}>
       {characters.map((reference, index) => (
         <ReferenceSlot
           key={`character-${index}`}
           kind="character"
           value={reference}
-          disabled={busy}
           onChange={(next) => {
             setNotice(undefined);
             setCharacters((current) =>
@@ -2497,32 +3234,55 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
             );
           }}
           onPick={() => setPicker({ slot: "character", index })}
+          onTag={() => tagCharacter(index)}
+          tagTitle={`Add <image${index + 1}> to the prompt`}
         />
       ))}
 
-      {characters.length < MAX_CHARACTERS && (
+      {characters.length < maxCharacters && (
         <ReferenceSlot
           kind="character"
-          disabled={busy}
           onChange={(next) => {
             if (!next) return;
             setNotice(undefined);
-            setCharacters((current) => [...current, next].slice(0, MAX_CHARACTERS));
+            setCharacters((current) => [...current, next].slice(0, maxCharacters));
           }}
           onPick={() => setPicker({ slot: "character", index: null })}
         />
       )}
 
-      <ReferenceSlot
-        kind="background"
-        value={background}
-        disabled={busy}
-        onChange={(next) => {
-          setNotice(undefined);
-          setBackground(next);
-        }}
-        onPick={() => setPicker({ slot: "background" })}
-      />
+      {!ref5 && (
+        <ReferenceSlot
+          kind="background"
+          value={background}
+          onChange={(next) => {
+            setNotice(undefined);
+            setBackground(next);
+          }}
+          onPick={() => setPicker({ slot: "background" })}
+        />
+      )}
+    </div>
+  );
+
+  // Auto (the default) leaves the whole edit to the ref5 graph; "Write it"
+  // opens the box, and those words become the request.
+  const ref5Switch = (
+    <div className="mode-group cast-switch" role="group" aria-label="Who writes the edit">
+      {[
+        { id: false, label: "Auto" },
+        { id: true, label: "Write it" },
+      ].map((option) => (
+        <button
+          key={option.label}
+          type="button"
+          className={ref5Prompt === option.id ? "is-active" : ""}
+          aria-pressed={ref5Prompt === option.id}
+          onClick={() => setRef5Prompt(option.id)}
+        >
+          {option.label}
+        </button>
+      ))}
     </div>
   );
 
@@ -2533,7 +3293,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
           key={`reference-${index}`}
           kind="reference"
           value={reference}
-          disabled={busy}
           onChange={(next) => {
             setNotice(undefined);
             setImageReferences((current) =>
@@ -2549,7 +3308,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       {imageReferences.length < maxImageReferences && (
         <ReferenceSlot
           kind="reference"
-          disabled={busy}
           onChange={(next) => {
             if (!next) return;
             setNotice(undefined);
@@ -2561,14 +3319,56 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     </div>
   );
 
+  /** One standalone entry in the video picker; local ones get the gear. */
+  const videoModelRow = (option: VideoModel) => (
+    <li key={option.id} className={option.provider === "local" ? "has-gear" : undefined}>
+      <button
+        type="button"
+        role="radio"
+        aria-checked={videoModel === option.id}
+        className={`model-option${videoModel === option.id ? " is-active" : ""}${
+          option.provider === "local" ? " has-config" : ""
+        }`}
+        onClick={() => {
+          setVideoModel(option.id);
+          setVideoModelOpen(false);
+        }}
+      >
+        <span className="model-text">
+          <span className="model-name">
+            {option.label}
+            <ModelLogo brand="minimax" />
+            <span className="model-provider">{option.id}</span>
+          </span>
+          <span className="model-note">{option.note}</span>
+        </span>
+        {videoModel === option.id && <CheckMark />}
+      </button>
+      {option.provider === "local" && (
+        <button
+          type="button"
+          className="model-gear"
+          title={
+            option.id === OPENJUTSU_MODEL_ID
+              ? "Model, clip, pipeline, prompt API and files"
+              : "Model, clip, steps and prompt model"
+          }
+          aria-label={`Configure ${option.label}`}
+          onClick={() => openLocalConfig(option.id === OPENJUTSU_MODEL_ID ? "openjutsu" : "local")}
+        >
+          <SlidersIcon />
+        </button>
+      )}
+    </li>
+  );
+
   const aiButton = (
     <button
       type="button"
       className={`ai-button${brain ? " is-on" : ""}`}
       onClick={() => setBrainOpen(true)}
-      title="Choose the model that rewrites your prompt"
+      title="Choose the prompt model"
       aria-haspopup="dialog"
-      disabled={busy}
     >
       <span className="ai-dot" aria-hidden="true" />
       <span className="ai-label">Flavor</span>
@@ -2581,26 +3381,56 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     </button>
   );
 
-  const framesRef = useRef<Frame[]>([]);
-  framesRef.current = frames;
-
-  // Rotating a phone or resizing a window should re-frame the work rather than
-  // leave it stranded under the panel.
+  // The layout switch is the window's width; it only decides which chrome the
+  // canvas draws around the board.
   useEffect(() => {
-    let timer = 0;
     const measure = () => setNarrow(window.innerWidth <= 900);
     measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, []);
 
-    function onResize() {
-      measure();
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => fit(framesRef.current), 160);
-    }
-    window.addEventListener("resize", onResize);
-    return () => {
-      window.clearTimeout(timer);
-      window.removeEventListener("resize", onResize);
-    };
+  /**
+   * Keep the board still when the canvas changes size.
+   *
+   * A resize used to re-fit everything, which threw away a pan or a zoom — and
+   * a phone fires `resize` for a keyboard, not just for a rotation. Here the
+   * board point in the middle of the usable area stays in the middle, so the
+   * work does not jump; a fit asked for before the canvas had a size is
+   * honoured as soon as it does.
+   */
+  useEffect(() => {
+    const element = canvasRef.current;
+    if (!element) return;
+
+    let previous = { width: element.clientWidth, height: element.clientHeight };
+
+    const observer = new ResizeObserver(() => {
+      const next = { width: element.clientWidth, height: element.clientHeight };
+      if (next.width < 2 || next.height < 2) return;
+
+      const waiting = pendingFit.current;
+      if (waiting) {
+        pendingFit.current = null;
+        fit(waiting);
+        previous = next;
+        return;
+      }
+
+      if (previous.width < 2 || previous.height < 2) {
+        previous = next;
+        return;
+      }
+      if (previous.width === next.width && previous.height === next.height) return;
+
+      const from = fitBox(previous.width, previous.height);
+      const to = fitBox(next.width, next.height);
+      setView((current) => recenter(current, from, to));
+      previous = next;
+    });
+
+    observer.observe(element);
+    return () => observer.disconnect();
   }, [fit]);
 
   if (loadError) {
@@ -2634,94 +3464,144 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
           className="canvas-world"
           style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})` }}
         >
-          {frames.map((frame, index) => (
-            <div
-              key={frame.id}
-              className={`stage-frame${selected === frame.id ? " is-selected" : ""}`}
-              style={{ width: FRAME_SIZE, height: FRAME_SIZE, transform: `translate(${frame.x}px, ${frame.y}px)` }}
-              onPointerDown={(event) => startFrameDrag(event, frame)}
-              title="Double-click to view full size"
-            >
-              {isVideoSrc(frame.src) ? (
-                <video src={mediaUrl(frame.src)} autoPlay muted loop playsInline preload="metadata" />
-              ) : (
-                <img src={mediaUrl(frame.src)} alt={frame.prompt} draggable={false} />
-              )}
-              <span className="frame-index">{String(index + 1).padStart(2, "0")}</span>
-              {(Boolean(frame.characterSrcs?.length) || Boolean(frame.backgroundSrc) || referenceCount(frame) > 0 || Boolean(frame.canvasSrc) || isVideoSrc(frame.src)) && (
-                <span className="frame-flags">
-                  {isVideoSrc(frame.src) && (
-                    <span className="frame-flag" title="Generated clip">
-                      <svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor">
-                        <path d="M8 5l11 7-11 7z" />
-                      </svg>
-                    </span>
-                  )}
-                  {referenceCount(frame) > 0 && (
-                    <span
-                      className="frame-flag"
-                      title={`Rendered with ${referenceCount(frame)} reference image${referenceCount(frame) === 1 ? "" : "s"}`}
-                    >
-                      <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2.2">
-                        <rect x="3" y="5" width="18" height="14" rx="2.5" />
-                        <circle cx="9" cy="10" r="1.6" />
-                        <path d="M4 17l5-4 4 3 3-2 4 3" />
-                      </svg>
-                    </span>
-                  )}
-                  {frame.canvasSrc && (
-                    <span className="frame-flag" title="Edited from a canvas image">
-                      <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2.2">
-                        <path d="M4 20l4-1 11-11-3-3L5 16l-1 4z" />
-                        <path d="M14 5l3 3" />
-                      </svg>
-                    </span>
-                  )}
-                  {Boolean(frame.characterSrcs?.length) && (
-                    <span className="frame-flag" title="Rendered with a character reference">
-                      <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2.2">
-                        <circle cx="12" cy="8" r="4" />
-                        <path d="M20 21a8 8 0 0 0-16 0" />
-                      </svg>
-                    </span>
-                  )}
-                  {frame.backgroundSrc && (
-                    <span className="frame-flag" title="Rendered with a background reference">
-                      <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2.2">
-                        <rect x="3" y="4" width="18" height="16" rx="2.5" />
-                        <path d="M4 17l5-4 4 3 3-2 4 3" />
-                      </svg>
-                    </span>
-                  )}
-                </span>
-              )}
-            </div>
-          ))}
+          {frames.map((frame, index) => {
+            // The slot is a square; the tile inside it keeps the media's shape
+            // and is centred, so a wide clip or a portrait still is never
+            // cropped to fit a grid cell it did not ask for.
+            const box = frameBox(frame, frameRatios[frame.id]);
+            const offset = frameOffset(box);
+            return (
+              <div
+                key={frame.id}
+                className={`stage-frame${selected === frame.id ? " is-selected" : ""}`}
+                style={{
+                  width: box.width,
+                  height: box.height,
+                  transform: `translate(${frame.x + offset.x}px, ${frame.y + offset.y}px)`,
+                }}
+                onPointerDown={(event) => startFrameDrag(event, frame)}
+                title={tool === "hand" ? "Drag to pan the board" : "Double-click to view full size"}
+              >
+                {isVideoSrc(frame.src) ? (
+                  <video
+                    src={mediaUrl(frame.src)}
+                    autoPlay
+                    muted
+                    loop
+                    playsInline
+                    preload="metadata"
+                    onLoadedMetadata={(event) =>
+                      rememberRatio(frame.id, event.currentTarget.videoWidth, event.currentTarget.videoHeight)
+                    }
+                  />
+                ) : (
+                  <img
+                    src={mediaUrl(frame.src)}
+                    alt={frame.prompt}
+                    draggable={false}
+                    onLoad={(event) =>
+                      rememberRatio(frame.id, event.currentTarget.naturalWidth, event.currentTarget.naturalHeight)
+                    }
+                  />
+                )}
+                <span className="frame-index">{String(index + 1).padStart(2, "0")}</span>
+                {(Boolean(frame.characterSrcs?.length) || Boolean(frame.backgroundSrc) || referenceCount(frame) > 0 || Boolean(frame.canvasSrc) || isVideoSrc(frame.src)) && (
+                  <span className="frame-flags">
+                    {isVideoSrc(frame.src) && (
+                      <span className="frame-flag" title="Generated clip">
+                        <svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor">
+                          <path d="M8 5l11 7-11 7z" />
+                        </svg>
+                      </span>
+                    )}
+                    {referenceCount(frame) > 0 && (
+                      <span
+                        className="frame-flag"
+                        title={`Rendered with ${referenceCount(frame)} reference image${referenceCount(frame) === 1 ? "" : "s"}`}
+                      >
+                        <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2.2">
+                          <rect x="3" y="5" width="18" height="14" rx="2.5" />
+                          <circle cx="9" cy="10" r="1.6" />
+                          <path d="M4 17l5-4 4 3 3-2 4 3" />
+                        </svg>
+                      </span>
+                    )}
+                    {frame.canvasSrc && (
+                      <span className="frame-flag" title="Edited from a canvas image">
+                        <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2.2">
+                          <path d="M4 20l4-1 11-11-3-3L5 16l-1 4z" />
+                          <path d="M14 5l3 3" />
+                        </svg>
+                      </span>
+                    )}
+                    {Boolean(frame.characterSrcs?.length) && (
+                      <span className="frame-flag" title="Rendered with a character reference">
+                        <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2.2">
+                          <circle cx="12" cy="8" r="4" />
+                          <path d="M20 21a8 8 0 0 0-16 0" />
+                        </svg>
+                      </span>
+                    )}
+                    {frame.backgroundSrc && (
+                      <span className="frame-flag" title="Rendered with a background reference">
+                        <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2.2">
+                          <rect x="3" y="4" width="18" height="16" rx="2.5" />
+                          <path d="M4 17l5-4 4 3 3-2 4 3" />
+                        </svg>
+                      </span>
+                    )}
+                  </span>
+                )}
+              </div>
+            );
+          })}
 
-          {/* Renders in flight: a blueprint square holds the slot and fills from
+          {/* Renders in flight: a blueprint tile holds the slot and fills from
               the bottom while the work is running. */}
           {pending.map((slot) => {
-            const track = tracks[slot.id];
+            const track = tracks[slot.renderId ?? slot.id];
             const fraction = trackFraction(track);
+            // The slot wears the shape the render is heading for, so a clip's
+            // tile is already wide (or tall) while it fills and the finished
+            // frame lands in the body that was on screen, not in a square.
+            const box = fitFrameBox(slot.aspect);
+            const offset = frameOffset(box);
+            const padding = Math.max(14, Math.min(34, Math.round(Math.min(box.width, box.height) * 0.066)));
             return (
               <div
                 key={slot.id}
-                className={`stage-frame is-pending${fraction !== undefined ? " is-tracked" : ""}`}
+                className={`stage-frame is-pending${fraction !== undefined ? " is-tracked" : ""}${
+                  armedPending === slot.id ? " is-armed" : ""
+                }`}
                 data-kind={slot.kind}
                 style={
                   {
-                    width: FRAME_SIZE,
-                    height: FRAME_SIZE,
-                    transform: `translate(${slot.x}px, ${slot.y}px)`,
+                    width: box.width,
+                    height: box.height,
+                    padding,
+                    transform: `translate(${slot.x + offset.x}px, ${slot.y + offset.y}px)`,
                     ...(fraction !== undefined ? { "--pending-progress": `${Math.round(fraction * 100)}%` } : {}),
                   } as React.CSSProperties
                 }
                 onPointerDown={(event) => startPendingDrag(event, slot)}
-                title="Drag to place this render"
+                title="Drag to place, click to cancel"
               >
                 <span className="pending-label">
                   {track?.label ?? (slot.kind === "video" ? "Rendering clip…" : "Rendering still…")}
                 </span>
+                {armedPending === slot.id && (
+                <button
+                  type="button"
+                  className="pending-cancel"
+                  title={slot.kind === "video" ? "Cancel this clip" : "Cancel this render"}
+                  aria-label={slot.kind === "video" ? "Cancel this clip" : "Cancel this render"}
+                  // Not a drag: the tile's own pointerdown would start one.
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onClick={() => void cancelPending(slot)}
+                >
+                  ✕
+                </button>
+                )}
                 {track && <span className="pending-clock">{clock(track.elapsed)}</span>}
                 <span className="pending-prompt">{slot.prompt}</span>
               </div>
@@ -2730,11 +3610,11 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
 
         {/* The hint is for an untouched canvas. A pending slot means a Generate
             press has already landed, so the ghost would only sit on top of the
-            blueprint square while the render runs. */}
+            blueprint tile while the render runs. */}
         {project && frames.length === 0 && pending.length === 0 && (
           <div className="canvas-empty">
             <div className="canvas-ghost" aria-hidden="true" />
-            <p>Describe a frame or a clip in the panel to place your first result.</p>
+            <p>Describe a shot in the panel to start.</p>
           </div>
         )}
 
@@ -2753,15 +3633,15 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
             <button
               type="button"
               onClick={() => void reuseFrame(selectedFrame)}
-              title="Fill the panel with this frame's prompt and settings"
+              title="Reuse this prompt and settings"
             >
               Reuse
             </button>
-            {isVideoSrc(selectedFrame.src) && (
+            {canContinueFrame(selectedFrame) && (
               <button
                 type="button"
                 onClick={() => void continueFrame(selectedFrame)}
-                title="Continue this clip from where it stopped"
+                title="Continue this clip"
               >
                 Continue
               </button>
@@ -2826,10 +3706,11 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 </button>
               </header>
 
-              {/* What the person typed. The rewrite lives in the metadata
-                  below: that is what the model saw, not what they wrote. */}
-              <p className="viewer-prompt">{viewerFrame.sourcePrompt?.trim() || viewerFrame.prompt}</p>
-              {viewerFrame.prompt !== (viewerFrame.sourcePrompt?.trim() || viewerFrame.prompt) && (
+              {/* What the person typed, falling back to the mode a promptless
+                  clip was made in. The rewrite lives in the metadata below:
+                  that is what the model saw, not what they wrote. */}
+              <p className="viewer-prompt">{frameTitle(viewerFrame)}</p>
+              {Boolean(viewerFrame.prompt?.trim()) && viewerFrame.prompt !== frameTitle(viewerFrame) && (
                 <details className="viewer-sent">
                   <summary>
                     Prompt sent{viewerFrame.enhanced ? " · rewritten" : ""}
@@ -2888,15 +3769,15 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 <button
                   type="button"
                   onClick={() => void reuseFrame(viewerFrame)}
-                  title="Fill the panel with this frame's prompt and settings"
+                  title="Reuse this prompt and settings"
                 >
                   Reuse
                 </button>
-                {isVideoSrc(viewerFrame.src) && (
+                {canContinueFrame(viewerFrame) && (
                   <button
                     type="button"
                     onClick={() => void continueFrame(viewerFrame)}
-                    title="Continue this clip from where it stopped"
+                    title="Continue this clip"
                   >
                     Continue
                   </button>
@@ -3075,7 +3956,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 aria-label={`Choose an image model (${activeImageModel.label})`}
                 aria-haspopup="dialog"
                 onClick={() => setImageModelOpen(true)}
-                disabled={busy}
               />
 
               <span className="row-icon" aria-hidden="true">
@@ -3098,7 +3978,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 aria-checked={canvasEnabled}
                 className={`edit-switch${canvasEnabled ? " is-on" : ""}`}
                 onClick={() => setCanvasEnabled((current) => !current)}
-                disabled={busy}
                 title="Edit a canvas image"
               >
                 <span className="edit-label">Edit</span>
@@ -3141,7 +4020,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                         })
                     : undefined
                 }
-                disabled={busy}
                 onPick={() => setPicker({ slot: "canvas" })}
                 onClear={() => setCanvasImage(undefined)}
               />
@@ -3183,7 +4061,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 value={imageRatio}
                 locked={canvasEnabled}
                 lockedHint="Set by the canvas image"
-                disabled={busy}
                 items={imageRatioOptions(activeImageModel).map((option) => ({
                   id: option.id,
                   label: option.label,
@@ -3198,7 +4075,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 title="Resolution"
                 label={imageResolutionLabel(imageResolution)}
                 value={imageResolution}
-                disabled={busy}
                 items={imageResolutionOptions(activeImageModel).map((option) => ({
                   id: option.id,
                   label: option.label,
@@ -3213,7 +4089,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 title="Images per press"
                 label={`×${imageBatch}`}
                 value={String(imageBatch)}
-                disabled={busy}
                 items={imageBatchOptions(activeImageModel).map((count) => ({
                   id: String(count),
                   label: `×${count}`,
@@ -3246,7 +4121,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
               type="button"
               className="panel-row"
               onClick={() => setVideoModelOpen(true)}
-              disabled={busy}
               aria-haspopup="dialog"
             >
               <span className="row-icon" aria-hidden="true">
@@ -3266,6 +4140,9 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
               </svg>
             </button>
 
+            {/* A model with one mode (Openjutsu) has nothing to switch, unless a
+                continuation is armed and Continue needs somewhere to live. */}
+            {(activeVideoModel.modes.length > 1 || continuation) && (
             <div className="mode-row">
               <span className="row-icon" aria-hidden="true">
                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.7">
@@ -3285,7 +4162,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                       type="button"
                       className={active ? "is-active" : ""}
                       aria-pressed={active}
-                      disabled={busy || !activeVideoModel.modes.includes(mode.id)}
+                      disabled={!activeVideoModel.modes.includes(mode.id)}
                       onClick={() => {
                         leaveContinuation();
                         setNotice(undefined);
@@ -3300,12 +4177,11 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                     </button>
                   );
                 })}
-                {continuation && activeVideoModel.modes.includes("video") && (
+                {continuation && supportsContinuation(activeVideoModel) && (
                   <button
                     type="button"
                     className={`is-continue${videoMode === "video" ? " is-active" : ""}`}
                     aria-pressed={videoMode === "video"}
-                    disabled={busy}
                     title="Extend this clip from where it stopped"
                     onClick={() => setVideoMode("video")}
                   >
@@ -3314,6 +4190,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 )}
               </div>
             </div>
+            )}
 
             {videoMode === "free" ? (
               takesReferences && (
@@ -3340,7 +4217,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                             })
                         : undefined
                     }
-                    disabled={busy}
                     onPick={() => setPicker({ slot: "first-frame" })}
                     onClear={() => setFirstFrame(undefined)}
                   />
@@ -3367,7 +4243,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                             })
                         : undefined
                     }
-                    disabled={busy}
                     onPick={() => setPicker({ slot: "last-frame" })}
                     onClear={() => setLastFrame(undefined)}
                   />
@@ -3403,7 +4278,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                           })
                       : undefined
                   }
-                  disabled={busy}
                   onPick={() => setPicker({ slot: videoMode === "audio" ? "audio" : "clip" })}
                   onClear={() => {
                     if (videoMode === "audio") {
@@ -3414,6 +4288,8 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                     // nothing left to hand back to Video Reference.
                     continuePrior.current = null;
                     setClipRef(undefined);
+                    setClipAssetId(undefined);
+                    setClipStart(0);
                     setContinuation(undefined);
                   }}
                 />
@@ -3433,20 +4309,26 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
             )}
 
             <div className="prompt-box">
-              <textarea
-                className="panel-prompt"
-                value={videoPrompt}
-                rows={4}
-                maxLength={900}
-                placeholder="Describe the shot…"
-                onChange={(event) => setVideoPrompt(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey) {
-                    event.preventDefault();
-                    void sendVideo();
-                  }
-                }}
-              />
+              {ref5 && ref5Switch}
+              {/* On Auto the ref5 graph writes the edit, so there is no box. */}
+              {ref5Auto && <p className="cast-hint">Add characters to cast them into the clip.</p>}
+              {!ref5Auto && (
+                <textarea
+                  ref={videoPromptRef}
+                  className="panel-prompt"
+                  value={videoPrompt}
+                  rows={4}
+                  maxLength={900}
+                  placeholder={ref5 ? "Describe the edit…" : "Describe the shot…"}
+                  onChange={(event) => setVideoPrompt(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      void sendVideo();
+                    }
+                  }}
+                />
+              )}
 
               <div className="prompt-footer">
                 {takesReferences && referenceStrip}
@@ -3460,11 +4342,10 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
               <ChipPicker
                 heading="Aspect ratio"
                 title="Aspect ratio"
-                label={videoRatioLabel(videoRatio)}
-                value={videoRatio}
+                label={videoRatioLabel(clipRenderRatio())}
+                value={clipRenderRatio()}
                 locked={modeLocks.ratio}
                 lockedHint="Set by the reference clip"
-                disabled={busy}
                 items={ratioOptions(activeVideoModel).map((option) => ({
                   id: option.id,
                   label: option.label,
@@ -3483,7 +4364,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                     ? "Set by the audio reference. Edit its trim window"
                     : "Set by the reference clip. Edit its trim window"
                 }
-                disabled={busy}
                 items={durationOptions(activeVideoModel).map((seconds) => ({
                   id: String(seconds),
                   label: `${seconds}s`,
@@ -3495,7 +4375,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 title="Resolution"
                 label={videoResolutionLabel(videoResolution)}
                 value={videoResolution}
-                disabled={busy}
                 items={resolutionOptions(activeVideoModel).map((option) => ({
                   id: option.id,
                   label: option.label,
@@ -3509,7 +4388,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                   {characters.length} character{characters.length === 1 ? "" : "s"}
                 </span>
               )}
-              {background && !hasKeyframes && <span className="chip static">Background</span>}
+              {background && !hasKeyframes && !ref5 && <span className="chip static">Background</span>}
               {firstFrame && <span className="chip static">First frame</span>}
               {lastFrame && <span className="chip static">Last frame</span>}
             </div>
@@ -3518,7 +4397,10 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
               type="button"
               className="generate"
               onClick={() => void sendVideo()}
-              disabled={busy || (videoMode === "free" && !videoPrompt.trim())}
+              disabled={
+                busy || Boolean(ref5Missing) || ((videoMode === "free" || (ref5 && !ref5Auto)) && !videoPrompt.trim())
+              }
+              title={ref5Missing}
             >
               {busy ? "Rendering…" : "Generate clip"}
             </button>
@@ -3536,15 +4418,15 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
             renders={renderAssets}
             liked={liked}
             pending={pending}
-            busy={busy}
-            onUpload={(asset) => setUploads((current) => addUpload(current, asset))}
-            onToggleLike={(id) => setLiked((current) => toggleLiked(current, id))}
+            onCancelPending={cancelLibraryPending}
+            onUpload={addLibraryUpload}
+            onToggleLike={toggleLibraryLike}
           />
         ) : (
           <div className="panel-body chat">
             <div className="chat-log" ref={chatLogRef}>
               {messages.length === 0 && (
-                <p className="chat-empty">Ask anything, or tell me what to set up.</p>
+                <p className="chat-empty">Ask anything about the setup.</p>
               )}
               {messages.map((message) => (
                 <div key={message.id} className={`chat-message ${message.role}`}>
@@ -3623,7 +4505,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
           uploads={uploads}
           renders={renderAssets}
           liked={liked}
-          busy={busy}
           onClose={() => setPicker(null)}
           onPick={applyPick}
           onUpload={(asset) => setUploads((current) => addUpload(current, asset))}
@@ -3648,13 +4529,45 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
           minDuration={activeVideoModel.minDuration}
           maxDuration={activeVideoModel.maxDuration}
           duration={videoDuration}
+          {...(videoMode === "video" ? { start: clipStart } : {})}
           onClose={() => setTrimOpen(false)}
-          onApply={({ duration, trimmed }) => {
+          onApply={({ duration, start, trimmed }) => {
             setVideoDuration(duration);
             if (trimmed && videoMode === "audio") setAudioRef(trimmed);
+            if (videoMode === "video") setClipStart(start ?? 0);
             setTrimOpen(false);
           }}
         />
+      )}
+
+      {blankPromptError && (
+        <div
+          className="overlay"
+          role="alertdialog"
+          aria-modal="true"
+          aria-label="Generation stopped"
+          onClick={() => setBlankPromptError(undefined)}
+        >
+          <div className="modal account-modal" onClick={(event) => event.stopPropagation()}>
+            <header>
+              <h2>Generation stopped</h2>
+              <button type="button" aria-label="Close" onClick={() => setBlankPromptError(undefined)}>
+                ✕
+              </button>
+            </header>
+            <p className="model-intro">
+              Openjutsu Prime&apos;s prompt model returned nothing usable twice, so the clip was skipped. Try again.
+            </p>
+            <p className="account-error" role="alert">
+              {blankPromptError}
+            </p>
+            <div className="account-actions">
+              <button type="button" className="account-save" autoFocus onClick={() => setBlankPromptError(undefined)}>
+                OK
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {videoModelOpen && (
@@ -3676,26 +4589,48 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
             <p className="model-intro">The model responsible for rendering video clips.</p>
 
             <ul className="model-list" role="group" aria-label="Video model">
-              {/* One card for the H3 family: the toggle in it picks the tier,
-                  and the note describes whichever tier is selected. */}
+              {pinnedVideoModels.map(videoModelRow)}
+
+              {/* One card for the H3 family. The card picks the tier last
+                  chosen in its toggle (Original until one is), and the note
+                  describes whichever tier that is. */}
               <li>
-                <div className={`model-option is-family${h3ActiveTier ? " is-active" : ""}`}>
+                <div
+                  role="radio"
+                  aria-checked={Boolean(h3ActiveTier)}
+                  tabIndex={0}
+                  className={`model-option is-family${h3ActiveTier ? " is-active" : ""}`}
+                  onClick={() => {
+                    setVideoModel(h3ShownTier.model.id);
+                    setVideoModelOpen(false);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter" && event.key !== " ") return;
+                    event.preventDefault();
+                    setVideoModel(h3ShownTier.model.id);
+                    setVideoModelOpen(false);
+                  }}
+                >
                   <span className="model-text">
                     <span className="model-name">
-                      {h3Tiers[0]?.model.family ?? "MiniMax H3"}
+                      {h3ShownTier.model.family ?? "MiniMax H3"}
                       <ModelLogo brand="minimax" />
-                      <span className="model-provider">{h3ActiveTier?.model.id ?? h3Tiers[0]?.model.id}</span>
+                      <span className="model-provider">{h3ShownTier.model.id}</span>
                     </span>
-                    <span className="model-note">{h3ActiveTier?.model.note ?? h3Tiers[0]?.model.note}</span>
+                    <span className="model-note">{h3ShownTier.model.note}</span>
                     <span className="model-tiers" role="group" aria-label="H3 tier">
                       {h3Tiers.map((tier) => (
                         <button
                           key={tier.id}
                           type="button"
-                          className={videoModel === tier.model.id ? "is-active" : ""}
-                          aria-pressed={videoModel === tier.model.id}
-                          disabled={busy}
-                          onClick={() => setVideoModel(tier.model.id)}
+                          className={h3ShownTier.model.id === tier.model.id ? "is-active" : ""}
+                          aria-pressed={h3ShownTier.model.id === tier.model.id}
+                          onClick={(event) => {
+                            // The tier toggle picks without closing the panel.
+                            event.stopPropagation();
+                            setH3Tier(tier.model.id);
+                            setVideoModel(tier.model.id);
+                          }}
                         >
                           {tier.label}
                         </button>
@@ -3706,43 +4641,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 </div>
               </li>
 
-              {standaloneVideoModels().map((option) => (
-                <li key={option.id} className={option.provider === "local" ? "has-gear" : undefined}>
-                  <button
-                    type="button"
-                    role="radio"
-                    aria-checked={videoModel === option.id}
-                    className={`model-option${videoModel === option.id ? " is-active" : ""}${
-                      option.provider === "local" ? " has-config" : ""
-                    }`}
-                    onClick={() => {
-                      setVideoModel(option.id);
-                      setVideoModelOpen(false);
-                    }}
-                  >
-                    <span className="model-text">
-                      <span className="model-name">
-                        {option.label}
-                        <ModelLogo brand="minimax" />
-                        <span className="model-provider">{option.id}</span>
-                      </span>
-                      <span className="model-note">{option.note}</span>
-                    </span>
-                    {videoModel === option.id && <CheckMark />}
-                  </button>
-                  {option.provider === "local" && (
-                    <button
-                      type="button"
-                      className="model-gear"
-                      title="Model, clip and steps"
-                      aria-label="Configure MiniMax H3 Local"
-                      onClick={openLocalConfig}
-                    >
-                      <SlidersIcon />
-                    </button>
-                  )}
-                </li>
-              ))}
+              {otherVideoModels.map(videoModelRow)}
             </ul>
           </div>
         </div>
@@ -3824,27 +4723,27 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
           document.body,
         )}
 
-      {localConfigOpen &&
+      {localConfigTarget &&
         createPortal(
           <div
             className="overlay"
             role="dialog"
             aria-modal="true"
-            aria-label="Configure MiniMax H3 Local"
-            onClick={() => setLocalConfigOpen(false)}
+            aria-label={localConfigTarget === "openjutsu" ? "Configure Openjutsu Prime" : "Configure MiniMax H3 Local"}
+            onClick={() => setLocalConfigTarget(null)}
           >
             <div className="modal account-modal model-config" onClick={(event) => event.stopPropagation()}>
               <header>
-                <h2>MiniMax H3 Local</h2>
+                <h2>{localConfigTarget === "openjutsu" ? "Openjutsu Prime" : "MiniMax H3 Local"}</h2>
                 <button
                   type="button"
                   className="account-verify"
-                  onClick={() => void verifyLocalConfig()}
+                  onClick={() => void verifyLocalConfig({ target: localConfigTarget })}
                   disabled={localBusy || verifying || !localDraft.unet.trim() || !localDraft.clip.trim()}
                 >
                   {verifying ? "Checking…" : "Verify"}
                 </button>
-                <button type="button" aria-label="Close configuration" onClick={() => setLocalConfigOpen(false)}>
+                <button type="button" aria-label="Close configuration" onClick={() => setLocalConfigTarget(null)}>
                   ✕
                 </button>
               </header>
@@ -3854,6 +4753,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                   {verifyBanner.text}
                 </p>
               )}
+
 
               <form className="account-form" onSubmit={saveLocalConfig}>
                 <label htmlFor="local-unet">Model name</label>
@@ -3900,30 +4800,228 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                   )}
                 </div>
 
-                <label htmlFor="local-steps">Steps</label>
-                <input
-                  id="local-steps"
-                  type="number"
-                  min={1}
-                  max={200}
-                  value={localDraft.steps}
-                  disabled={localBusy}
-                  onChange={(event) => setLocalDraft((current) => ({ ...current, steps: event.target.value }))}
-                />
+                {/* The second pass's and upscale pass's files, folded away until asked for. */}
+                {localConfigTarget === "openjutsu" && (
+                  <>
+                    <button
+                      type="button"
+                      className="extras-toggle"
+                      aria-expanded={extrasOpen}
+                      onClick={() => setExtrasOpen((open) => !open)}
+                    >
+                      Extras {extrasOpen ? "▴" : "▾"}
+                    </button>
+                    {extrasOpen && (
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={localDraft.upscale}
+                        className={`edit-switch extras-switch${localDraft.upscale ? " is-on" : ""}`}
+                        disabled={localBusy}
+                        title="The 2x upscale pass, off by default. The finished clip is saved before it runs, so a failed upscale still leaves a clip."
+                        onClick={() => setLocalDraft((current) => ({ ...current, upscale: !current.upscale }))}
+                      >
+                        <span className="edit-label">Upscale 2x</span>
+                        <span className="row-toggle" aria-hidden="true" />
+                      </button>
+                    )}
+                    {/* The same cap as MiniMax H3 Local's: the reference video
+                        H3 encodes, not the render's size. 544p is a hard
+                        limit here, Match output included. */}
+                    {extrasOpen && (
+                      <>
+                        <label htmlFor="openjutsu-ref-video">Video reference cap</label>
+                        <select
+                          id="openjutsu-ref-video"
+                          value={localDraft.refVideoEdge}
+                          disabled={localBusy}
+                          onChange={(event) =>
+                            setLocalDraft((current) => ({ ...current, refVideoEdge: event.target.value }))
+                          }
+                        >
+                          {OPENJUTSU_REF_VIDEO_EDGES.map((edge) => (
+                            <option key={edge} value={edge}>
+                              {edge === 0 ? `Match output (max ${OPENJUTSU_REF_VIDEO_LIMIT}p)` : `Up to ${edge}p`}
+                            </option>
+                          ))}
+                        </select>
+                      </>
+                    )}
+                    {extrasOpen &&
+                      OPENJUTSU_EXTRAS.map(([key, label, fallback]) => {
+                        const found = verifyResult?.checked
+                          ? verifyResult.files?.find((file) => file.key === key)?.found
+                          : undefined;
+                        const status = found === true ? "ok" : found === false ? "bad" : undefined;
+                        return (
+                          <Fragment key={key}>
+                            <label htmlFor={`local-${key}`}>{label}</label>
+                            <div className="field">
+                              <input
+                                id={`local-${key}`}
+                                className={status === "ok" ? "is-ok" : status === "bad" ? "is-bad" : undefined}
+                                value={localDraft[key]}
+                                autoComplete="off"
+                                spellCheck={false}
+                                placeholder={fallback}
+                                disabled={localBusy}
+                                onChange={(event) => {
+                                  setVerifyResult(null);
+                                  setLocalDraft((current) => ({ ...current, [key]: event.target.value }));
+                                }}
+                              />
+                              {status && (
+                                <span className={`field-mark ${status}`} aria-hidden="true">
+                                  {status === "ok" ? "✓" : "✗"}
+                                </span>
+                              )}
+                            </div>
+                          </Fragment>
+                        );
+                      })}
+                  </>
+                )}
 
-                <label htmlFor="local-ref-video">Video reference cap</label>
-                <select
-                  id="local-ref-video"
-                  value={localDraft.refVideoEdge}
-                  disabled={localBusy}
-                  onChange={(event) => setLocalDraft((current) => ({ ...current, refVideoEdge: event.target.value }))}
-                >
-                  {REF_VIDEO_EDGES.map((edge) => (
-                    <option key={edge} value={edge}>
-                      {edge === 0 ? "Match output" : `Up to ${edge}p`}
-                    </option>
-                  ))}
-                </select>
+                {/* Openjutsu's graph keeps the workflow's own steps. */}
+                {localConfigTarget === "local" && (
+                  <>
+                    <label htmlFor="local-steps">Steps</label>
+                    <input
+                      id="local-steps"
+                      type="number"
+                      min={1}
+                      max={200}
+                      value={localDraft.steps}
+                      disabled={localBusy}
+                      onChange={(event) => setLocalDraft((current) => ({ ...current, steps: event.target.value }))}
+                    />
+
+                    {/* Reference rewrites happen here, so this machine's
+                        gear owns the model that writes them. */}
+                    <label htmlFor="local-prompt-model">Prompt model</label>
+                    <input
+                      id="local-prompt-model"
+                      type="text"
+                      value={localDraft.promptModel}
+                      autoComplete="off"
+                      spellCheck={false}
+                      placeholder={REFERENCE_PROMPT_SPEC}
+                      aria-invalid={localDraft.promptModel.trim() !== "" && !parsePromptSpec(localDraft.promptModel)}
+                      disabled={localBusy}
+                      onChange={(event) =>
+                        setLocalDraft((current) => ({ ...current, promptModel: event.target.value }))
+                      }
+                    />
+
+                    <label htmlFor="local-ref-video">Video reference cap</label>
+                    <select
+                      id="local-ref-video"
+                      value={localDraft.refVideoEdge}
+                      disabled={localBusy}
+                      onChange={(event) => setLocalDraft((current) => ({ ...current, refVideoEdge: event.target.value }))}
+                    >
+                      {REF_VIDEO_EDGES.map((edge) => (
+                        <option key={edge} value={edge}>
+                          {edge === 0 ? "Match output" : `Up to ${edge}p`}
+                        </option>
+                      ))}
+                    </select>
+                  </>
+                )}
+
+                {/* Which API the graph calls. Comfy is the default and needs
+                    no key; OR reveals the OpenRouter key and turns the
+                    border check back on. */}
+                {localConfigTarget === "openjutsu" && (
+                  <>
+                    <div className="api-toggle">
+                      <span className="api-toggle-label">API key</span>
+                      <div className="api-toggle-buttons" role="group" aria-label="API key">
+                        {OPENJUTSU_PROMPT_APIS.map((option) => (
+                          <button
+                            key={option.id}
+                            type="button"
+                            className={localDraft.promptApi === option.id ? "is-active" : ""}
+                            aria-pressed={localDraft.promptApi === option.id}
+                            title={option.note}
+                            disabled={localBusy}
+                            onClick={() =>
+                              setLocalDraft((current) => ({
+                                ...current,
+                                promptApi: option.id as OpenjutsuPromptApi,
+                              }))
+                            }
+                          >
+                            {option.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {localDraft.promptApi === "openrouter" && (
+                      <>
+                        <label htmlFor="local-openrouter">OpenRouter key</label>
+                        {/* Masked by CSS, not type="password": a password
+                            field makes the browser read the text field above
+                            it as a username and offer to save the pair as a
+                            login. */}
+                        <input
+                          id="local-openrouter"
+                          type="text"
+                          className="secret-input"
+                          value={localDraft.openRouterKey}
+                          autoComplete="off"
+                          data-1p-ignore
+                          data-lpignore="true"
+                          data-bwignore="true"
+                          data-form-type="other"
+                          spellCheck={false}
+                          placeholder="sk-or-v1-… (or OPENROUTER_API_KEY)"
+                          disabled={localBusy}
+                          onChange={(event) =>
+                            setLocalDraft((current) => ({ ...current, openRouterKey: event.target.value }))
+                          }
+                        />
+                      </>
+                    )}
+
+                    <label htmlFor="local-openjutsu-mode">Mode</label>
+                    <select
+                      id="local-openjutsu-mode"
+                      value={localDraft.openjutsuMode}
+                      disabled={localBusy}
+                      onChange={(event) =>
+                        setLocalDraft((current) => ({
+                          ...current,
+                          openjutsuMode: event.target.value as OpenjutsuMode,
+                        }))
+                      }
+                    >
+                      {OPENJUTSU_MODE_OPTIONS.map((option) => (
+                        <option key={option.id} value={option.id} title={option.note}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+
+                    {/* With Extras open, each file already shows its mark on its own field. */}
+                    {!extrasOpen && verifyResult?.checked && verifyResult.files && (
+                      <ul className="verify-files" aria-label="Other files Openjutsu Prime loads">
+                        {verifyResult.files.map((file) => (
+                          <li
+                            key={file.label}
+                            className={file.found === true ? "ok" : file.found === false ? "bad" : undefined}
+                            title={file.name}
+                          >
+                            <span aria-hidden="true">{file.found === true ? "✓" : file.found === false ? "✗" : "?"}</span>
+                            <span>{file.label}</span>
+                            <code>{file.name}</code>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </>
+                )}
 
                 {localError && (
                   <p className="account-error" role="alert">
@@ -3932,7 +5030,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 )}
 
                 <div className="account-actions">
-                  <button type="button" className="account-cancel" onClick={() => setLocalConfigOpen(false)}>
+                  <button type="button" className="account-cancel" onClick={() => setLocalConfigTarget(null)}>
                     Cancel
                   </button>
                   <button
@@ -3967,7 +5065,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
               </button>
             </header>
 
-            <p className="model-intro">Choose the Prompt Enhancer model.</p>
+            <p className="model-intro">Rewrites your prompt before rendering.</p>
 
             <ul className="model-list" role="radiogroup" aria-label="Flavor model">
               <li>

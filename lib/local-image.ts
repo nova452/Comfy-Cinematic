@@ -28,13 +28,17 @@ import {
   type LocalImageModelConfig,
 } from "./harness.ts";
 import {
+  cancelled,
   classicAssetName,
+  classicCancel,
   classicError,
   classicRunError,
   classicViewUrl,
+  deadline,
   detectLocalSurface,
   localEndpoint,
   localFailure,
+  pause,
   splitDataUri,
   type ClassicFileRef,
   type LocalGraph,
@@ -316,11 +320,6 @@ function readField(value: unknown, key: string): unknown {
   return value && typeof value === "object" ? Reflect.get(value, key) : undefined;
 }
 
-/** Node has no `timers/promises` import here; one tiny wait is enough. */
-function wait(ms: number) {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms));
-}
-
 /**
  * Every file a save node wrote, in server order.
  *
@@ -364,6 +363,7 @@ async function runClassicImage(
   apiKey: string | undefined,
   plan: LocalImagePlan,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<LocalImageResult> {
   const base = endpoint.replace(/\/+$/, "");
   const headers: Record<string, string> = {};
@@ -383,7 +383,7 @@ async function runClassicImage(
       method: "POST",
       headers,
       body: form,
-      signal: AbortSignal.timeout(120_000),
+      signal: deadline(120_000, signal),
       redirect: redirectMode(),
     });
     if (!response.ok) {
@@ -409,8 +409,12 @@ async function runClassicImage(
     throw new Error(classicError(submitted) ?? "ComfyUI accepted the graph but returned no prompt id.");
   }
 
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const giveUpAt = Date.now() + timeoutMs;
+  while (Date.now() < giveUpAt) {
+    if (signal?.aborted) {
+      await classicCancel(base, headers, promptId);
+      throw cancelled();
+    }
     const response = await fetch(`${base}/history/${encodeURIComponent(promptId)}`, {
       headers,
       cache: "no-store",
@@ -449,7 +453,7 @@ async function runClassicImage(
       }
     }
 
-    await wait(1_200);
+    await pause(1_200, signal);
   }
 
   throw new Error(`The local render did not finish within ${Math.round(timeoutMs / 1000)}s.`);
@@ -486,6 +490,8 @@ export async function runLocalImage(
     timeoutMs?: number;
     /** Skip the probe when the caller already knows the surface. */
     surface?: LocalSurface;
+    /** A tile's ✕: stops the job on the target and throws `Cancelled.`. */
+    signal?: AbortSignal;
   } = {},
 ): Promise<LocalImageResult> {
   const endpoint = options.baseUrl?.trim() || localEndpoint();
@@ -504,7 +510,7 @@ export async function runLocalImage(
   // A bare ComfyUI has no /api/v2; ask once, then submit the way it expects.
   const surface = options.surface ?? (await detectLocalSurface(endpoint, options.apiKey));
   if (surface === "classic") {
-    return runClassicImage(endpoint, options.apiKey, plan, options.timeoutMs ?? 600_000);
+    return runClassicImage(endpoint, options.apiKey, plan, options.timeoutMs ?? 600_000, options.signal);
   }
 
   const client = clientFor(endpoint, options.apiKey);
@@ -515,9 +521,21 @@ export async function runLocalImage(
     workflow.setInput(upload.nodeId, upload.field, asset);
   }
 
-  const job = await client.run(workflow, { timeoutMs: options.timeoutMs ?? 600_000 }).catch((error: unknown) => {
+  // Submit and wait apart, as the clip runner does, so a cancel has a job to stop.
+  const { signal } = options;
+  const job = await client.submit(workflow).catch((error: unknown) => {
     throw localFailure(error);
   });
+  try {
+    await job.wait(options.timeoutMs ?? 600_000, signal);
+    await job.result();
+  } catch (error) {
+    if (signal?.aborted) {
+      await job.cancel().catch(() => undefined);
+      throw cancelled();
+    }
+    throw localFailure(error);
+  }
   const outputs = job.getOutputs(LOCAL_IMAGE_SAVE_NODE);
   if (outputs.length === 0) throw new Error("The local graph produced no image output.");
 

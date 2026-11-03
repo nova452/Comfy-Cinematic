@@ -14,6 +14,7 @@ import {
 } from "../lib/assets";
 import {
   MAX_MEDIA_MB,
+  fileFromSrc,
   mediaFromSrc,
   prepareMedia,
   prepareReference,
@@ -37,7 +38,6 @@ type Props = {
   uploads: Asset[];
   renders: Asset[];
   liked: string[];
-  busy?: boolean;
   onClose: () => void;
   onPick: (picked: PickedAsset) => void;
   onUpload: (asset: Asset) => void;
@@ -66,7 +66,6 @@ export function AssetPicker({
   uploads,
   renders,
   liked,
-  busy,
   onClose,
   onPick,
   onUpload,
@@ -76,14 +75,15 @@ export function AssetPicker({
   const [sort, setSort] = useState<AssetSort>("recent");
   const [working, setWorking] = useState(false);
   const [dragging, setDragging] = useState(false);
-  const [editing, setEditing] = useState<File | null>(null);
+  /** The clip in the editor, plus the library asset it came from, if any. */
+  const [editing, setEditing] = useState<{ file: File; asset?: Asset } | null>(null);
   const [error, setError] = useState<string>();
 
   const panelRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const dragDepth = useRef(0);
 
-  const disabled = Boolean(busy) || working;
+  const disabled = working;
   const shown = useMemo(
     () => pickAssets({ uploads, renders, liked }, kind, tab, sort),
     [uploads, renders, liked, kind, tab, sort],
@@ -91,9 +91,9 @@ export function AssetPicker({
   const empty =
     tab === "generations"
       ? kind === "video"
-        ? "No clips yet. Generate a clip to reuse it here."
-        : "No stills yet. Generate an image to reuse it here."
-      : "Nothing in Saved yet. Star an asset and it will wait here.";
+        ? "No clips yet. Generate one to reuse it here."
+        : "No stills yet. Generate one to reuse it here."
+      : "Nothing saved yet. Star an asset to keep it here.";
   // Nothing in this app renders an audio file, so that slot has no Output tab.
   // A video slot gains the bundled Samples tab: clips to try before uploading.
   const tabs =
@@ -161,16 +161,15 @@ export function AssetPicker({
     // A clip gets a trim/crop pass first; stills and tracks go straight in.
     if (kind === "video") {
       setError(undefined);
-      setEditing(file);
+      setEditing({ file });
       return;
     }
 
     await commitUpload(file);
   }
 
-  async function choose(asset: Asset) {
-    if (disabled || asset.kind !== kind) return;
-
+  /** Read a library asset and hand it to the slot as it is. */
+  async function pick(asset: Asset) {
     setWorking(true);
     setError(undefined);
     try {
@@ -186,6 +185,27 @@ export function AssetPicker({
     } finally {
       setWorking(false);
     }
+  }
+
+  async function choose(asset: Asset) {
+    if (disabled || asset.kind !== kind) return;
+
+    // A clip gets the same trim/crop pass from the library as from the file
+    // system, so a reused clip cannot slip past it.
+    if (asset.kind === "video") {
+      setWorking(true);
+      setError(undefined);
+      try {
+        setEditing({ file: await fileFromSrc(asset.src, asset.name), asset });
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "Could not read that asset.");
+      } finally {
+        setWorking(false);
+      }
+      return;
+    }
+
+    await pick(asset);
   }
 
   return (
@@ -313,11 +333,16 @@ export function AssetPicker({
 
       {editing && (
         <VideoEditModal
-          file={editing}
+          file={editing.file}
           onCancel={() => setEditing(null)}
           onApply={(edited, seconds) => {
+            const source = editing.asset;
+            const untouched = edited === editing.file;
             setEditing(null);
-            void commitUpload(edited, seconds);
+            // An untouched library clip goes in as itself; only a re-encoded
+            // edit joins the uploads as a new asset.
+            if (source && untouched) void pick(source);
+            else void commitUpload(edited, seconds);
           }}
         />
       )}

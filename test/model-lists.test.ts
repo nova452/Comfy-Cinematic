@@ -145,3 +145,50 @@ test("a target with /object_info is not probed at all", async () => {
     globalThis.fetch = original;
   }
 });
+
+test("the Openjutsu probe also reaches a LoRA and the latent upscaler", () => {
+  const graph = probeGraph(true);
+  assert.equal(graph["13"]!.inputs.lora_name, PROBE_NAME);
+  assert.equal(graph["14"]!.inputs.model_name, PROBE_NAME);
+  // Spliced into the chain the save node already validates.
+  assert.deepEqual(graph["6"]!.inputs.model, ["13", 0]);
+  assert.deepEqual(graph["15"]!.inputs.model, ["14", 0]);
+  assert.deepEqual(graph["10"]!.inputs.latent_image, ["15", 0]);
+  // The plain probe is unchanged.
+  assert.equal(probeGraph()["13"], undefined);
+  assert.deepEqual(probeGraph()["10"]!.inputs.latent_image, ["2", 0]);
+
+  const lists = listsFromNodeErrors({
+    "13": { class_type: "LoraLoaderModelOnly", errors: [{ details: "lora_name: 'x' not in ['a.safetensors']" }] },
+    "14": { class_type: "LatentUpscaleModelLoader", errors: [{ details: "model_name: 'x' not in ['up.safetensors']" }] },
+  });
+  assert.deepEqual(lists.lora, ["a.safetensors"]);
+  assert.deepEqual(lists.upscaler, ["up.safetensors"]);
+});
+
+test("Openjutsu reads the LoRA and upscaler lists off /object_info too", async () => {
+  const original = globalThis.fetch;
+  const enumOf = (node: string, field: string, options: string[]) =>
+    Response.json({ [node]: { input: { required: { [field]: [options] } } } });
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.endsWith("/object_info/UNETLoader")) return enumOf("UNETLoader", "unet_name", ["a.safetensors"]);
+    if (url.endsWith("/object_info/CLIPLoader")) return enumOf("CLIPLoader", "clip_name", ["b.safetensors"]);
+    if (url.endsWith("/object_info/LoraLoaderModelOnly")) return enumOf("LoraLoaderModelOnly", "lora_name", ["l.safetensors"]);
+    if (url.endsWith("/object_info/LatentUpscaleModelLoader")) {
+      return enumOf("LatentUpscaleModelLoader", "model_name", ["u.safetensors"]);
+    }
+    return new Response("unexpected", { status: 500 });
+  }) as typeof fetch;
+
+  try {
+    const lists = await loaderLists("http://127.0.0.1:8189", undefined, true);
+    assert.deepEqual(lists.lora, { ok: true, options: ["l.safetensors"] });
+    assert.deepEqual(lists.upscaler, { ok: true, options: ["u.safetensors"] });
+    // Without extras, the two lists are not asked for.
+    const plain = await loaderLists("http://127.0.0.1:8189");
+    assert.equal(plain.lora, undefined);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

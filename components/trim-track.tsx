@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { snapWindow } from "../lib/video";
+import { placeWindow } from "../lib/video";
 
 type Props = {
   total: number;
@@ -13,6 +13,11 @@ type Props = {
   max?: number;
   /** Snap unit: 1 for whole seconds, 0.1 in the clip editor. */
   step?: number;
+  /**
+   * Snap unit for where the window sits, finer than `step` so a drag glides;
+   * the window's length still snaps to `step`. Defaults to `step`.
+   */
+  positionStep?: number;
   disabled?: boolean;
   onWindow: (start: number, end: number) => void;
   onPreview?: (seconds: number) => void;
@@ -33,6 +38,7 @@ export function TrimTrack({
   min = 1,
   max = total,
   step = 1,
+  positionStep = step,
   disabled,
   onWindow,
   onPreview,
@@ -75,10 +81,9 @@ export function TrimTrack({
     };
 
     if (mode === "move" && (time < start || time > end)) {
-      // Clicking outside the window recentres it on the pointer, snapped to
-      // the track's unit so the readout stays tidy.
+      // Clicking outside the window recentres it on the pointer.
       const width = end - start;
-      const next = snapWindow(time - width / 2, time + width / 2, total, minWindow, maxWindow, unit);
+      const next = placeWindow("move", time - width / 2, time + width / 2, total, minWindow, maxWindow, unit, positionStep);
       onWindow(next.start, next.end);
       state = { mode: "move", originX: event.clientX, start: next.start, end: next.end };
     }
@@ -95,20 +100,11 @@ export function TrimTrack({
       if (!current) return;
 
       const delta = (move.clientX - current.originX) * (total / Math.max(1, bounds.width));
-      let nextStart = current.start;
-      let nextEnd = current.end;
-
-      if (current.mode === "start") {
-        nextStart = Math.min(Math.max(0, current.start + delta), current.end - minWindow);
-      } else if (current.mode === "end") {
-        nextEnd = Math.max(Math.min(ceiling, current.end + delta), current.start + minWindow);
-      } else {
-        const width = current.end - current.start;
-        nextStart = Math.min(Math.max(0, current.start + delta), Math.max(0, ceiling - width));
-        nextEnd = nextStart + width;
-      }
-
-      const snapped = snapWindow(nextStart, nextEnd, total, minWindow, maxWindow, unit);
+      // A handle moves its own edge; a move shifts both. The far edge, or the
+      // length, is what `placeWindow` holds.
+      const nextStart = current.mode === "end" ? current.start : current.start + delta;
+      const nextEnd = current.mode === "start" ? current.end : current.end + delta;
+      const snapped = placeWindow(current.mode, nextStart, nextEnd, total, minWindow, maxWindow, unit, positionStep);
       onWindow(snapped.start, snapped.end);
       onPreview?.(current.mode === "end" ? snapped.end : snapped.start);
     }

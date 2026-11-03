@@ -119,7 +119,7 @@ export type Tool = {
 export const TOOLS: Tool[] = [
   {
     id: "bfl/flux-3-image",
-    label: "FLUX 3",
+    label: "FLUX 3 Image",
     model: "bfl/flux-3-image",
     aspectRatio: DEFAULT_IMAGE_RATIO,
     resolution: DEFAULT_IMAGE_RESOLUTION,
@@ -128,7 +128,7 @@ export const TOOLS: Tool[] = [
     maxBatch: MAX_IMAGE_BATCH,
     kind: "image",
     provider: "router",
-    note: "Black Forest Labs' FLUX 3 through Comfy Router: sixteen ratios, 0.75K to 4K, up to four images per press.",
+    note: "FLUX.3 Image is Black Forest Labs' flagship image and editing model.",
   },
   {
     id: "local/flux-3-image",
@@ -141,7 +141,7 @@ export const TOOLS: Tool[] = [
     maxBatch: MAX_IMAGE_BATCH,
     kind: "image",
     provider: "local",
-    note: "The same FLUX 3 stack on your own ComfyUI or a Comfy deployment, through the Comfy SDK.",
+    note: "The same FLUX 3 stack on your own ComfyUI, via the Comfy SDK.",
   },
 ];
 
@@ -327,7 +327,7 @@ const TOPICS: Topic[] = [
     id: "continue",
     test: /\b(extend|continuation)\b|\b(continue|extend|lengthen)\b[^.]{0,60}\b(video|clip|movie|film|animation|render)\b/i,
     answer:
-      "Open a clip and press Continue: the panel arms a continuation — the clip takes the video-reference slot, the prompt, model and reference stills come back the way the clip was made, and the render starts where the clip stopped, with only its last frames sent as the motion guide. Attaching any clip in Video Reference mode does the same without the button, and a first or last frame in Free mode pins the start or end instead. MiniMax H3 Local renders these free on your own ComfyUI; Router renders cost credits.",
+      "Open a clip and press Continue: the panel arms a continuation — the clip takes the video-reference slot, the prompt, timing and reference stills come back the way the clip was made, and the render starts where the clip stopped, with only its last frames sent as the motion guide. Continue is offered on clips made with MiniMax H3, on Router or locally; Openjutsu casts characters into a clip and has no continuation. Attaching any clip in Video Reference mode does the same without the button, and a first or last frame in Free mode pins the start or end instead. MiniMax H3 Local renders these free on your own ComfyUI; Router renders cost credits.",
   },
   {
     id: "video",

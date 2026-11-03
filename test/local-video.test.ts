@@ -6,6 +6,7 @@ import {
   buildLocalVideoGraph,
   classicAssetName,
   classicError,
+  classicPromptBody,
   classicRunError,
   classicVideoRef,
   hasAudioTrack,
@@ -26,6 +27,16 @@ const MP4 = "data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28y";
 const MP4_AUDIO = `data:video/mp4;base64,${Buffer.from("ftypisommoovtrakmdiahdlrsounmp4a").toString("base64")}`;
 
 const env = (vars: Record<string, string | undefined> = {}): NodeJS.ProcessEnv => ({ NODE_ENV: "test", ...vars });
+
+test("the signed-in key rides along for partner nodes, and only when there is one", () => {
+  const graph = {};
+  assert.deepEqual(classicPromptBody(graph, "c1", "comfyui-key"), {
+    prompt: graph,
+    client_id: "c1",
+    extra_data: { api_key_comfy_org: "comfyui-key" },
+  });
+  assert.deepEqual(classicPromptBody(graph, "c1"), { prompt: graph, client_id: "c1" });
+});
 
 test("the configuration names the loaders and the step count", () => {
   const config = { unet: "my-unet.safetensors", clip: "my-clip.safetensors", steps: 12 };

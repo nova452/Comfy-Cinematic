@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { progressFromJob } from "../lib/local-video.ts";
+import { pause, progressFromJob } from "../lib/local-video.ts";
 import {
+  CANCELLED_MESSAGE,
+  cancelRender,
+  cancelSignal,
   clearProgress,
   finishProgress,
   isRenderId,
+  isSamplerProgress,
   progressLabel,
   readProgress,
   reportProgress,
@@ -27,6 +31,33 @@ test("a running deployment job reports its sampler step", () => {
   });
   assert.deepEqual(update, { stage: "running", step: 21, steps: 25, node: "SamplerCustomAdvanced", value: 0.77 });
   assert.equal(progressLabel(update!), "Sampling 21/25");
+});
+
+test("a counter is named after the node keeping it, and dropped when the node changes", () => {
+  // VHS counts the source clip's frames while it loads; that is not sampling.
+  const loading = { stage: "running" as const, step: 196, steps: 265, node: "VHS_LoadVideoFFmpeg" };
+  assert.equal(progressLabel(loading), "Loading the clip 196/265");
+  assert.equal(isSamplerProgress(loading), false);
+  assert.equal(progressLabel({ stage: "running", node: "OpenRouterStructuredOutputMultiTurn" }), "Thinking…");
+  assert.equal(progressLabel({ stage: "running", node: "GeminiNodeV3" }), "Thinking…");
+  assert.equal(progressLabel({ stage: "running", node: "OpenRouterDecisions" }), "Checking the frame…");
+  assert.equal(isSamplerProgress({ node: "SamplerCustomAdvanced" }), true);
+  assert.equal(isSamplerProgress({}), true);
+
+  // The loader's last count must not hang on while the prompt model runs.
+  const id = "6d1a77a0-5d6b-4c43-9c7e-6f2b1d1f2a10";
+  reportProgress(id, { ...loading, value: 0.2 });
+  reportProgress(id, { stage: "running", node: "OpenRouterStructuredOutputMultiTurn" });
+  const after = readProgress(id)!;
+  assert.equal(after.step, undefined);
+  assert.equal(after.steps, undefined);
+  assert.equal(after.value, 0.2);
+  assert.equal(progressLabel(after), "Thinking…");
+  // The same node keeps its numbers between reports that omit them.
+  reportProgress(id, { stage: "running", node: "SamplerCustomAdvanced", step: 3, steps: 8 });
+  reportProgress(id, { stage: "running", node: "SamplerCustomAdvanced" });
+  assert.equal(readProgress(id)!.step, 3);
+  clearProgress(id);
 });
 
 test("a queued job reports its place, and terminal states are left to the runner", () => {
@@ -72,11 +103,38 @@ test("a finished render is kept for one collection; a failure keeps its words", 
   assert.deepEqual([readProgress(bad)!.stage, readProgress(bad)!.error], ["failed", "unet_name: 'x' not in list"]);
   assert.equal(takeOutcome(bad), undefined);
   finishProgress("c0ffee00-0000-4000-8000-000000000000", false, "not json");
-  assert.equal(readProgress("c0ffee00-0000-4000-8000-000000000000")!.error, "The clip could not be rendered.");
+  assert.equal(readProgress("c0ffee00-0000-4000-8000-000000000000")!.error, "The render failed.");
 });
 
 test("only uuid-shaped render ids are accepted", () => {
   assert.equal(isRenderId("bb55e4d4-fa98-418d-9c12-b9d8d5207226"), true);
   assert.equal(isRenderId("../etc/passwd"), false);
   assert.equal(isRenderId(42), false);
+});
+
+test("a render can be cancelled by its tile id until it finishes", () => {
+  const id = "a11ce000-0000-4000-8000-00000000c0de";
+  const signal = cancelSignal(id)!;
+  assert.equal(cancelSignal(id), signal, "one signal per render");
+  assert.equal(signal.aborted, false);
+  assert.equal(cancelRender(id), true);
+  assert.equal(signal.aborted, true);
+  assert.equal((signal.reason as Error).message, CANCELLED_MESSAGE);
+  // Twice is not news, and a finished render is not running to cancel.
+  assert.equal(cancelRender(id), false);
+  finishProgress(id, false, { error: CANCELLED_MESSAGE, code: "cancelled" });
+  assert.equal(readProgress(id)!.error, CANCELLED_MESSAGE);
+  assert.equal(cancelRender(id), false);
+  assert.equal(cancelSignal(undefined), undefined);
+  clearProgress(id);
+});
+
+test("a cancellable wait ends early on the cancel", async () => {
+  const controller = new AbortController();
+  const started = Date.now();
+  const waiting = pause(5_000, controller.signal);
+  controller.abort();
+  await waiting;
+  assert.ok(Date.now() - started < 1_000);
+  await pause(10);
 });

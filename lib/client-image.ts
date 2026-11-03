@@ -115,6 +115,9 @@ export type MediaFile = {
   mb: number;
   /** Clip or track length when the browser can read it. */
   seconds?: number;
+  /** A clip's own shape, in pixels: what a motion reference renders at. */
+  width?: number;
+  height?: number;
 };
 
 /** A blob the page just produced (a re-encoded tail), as a data URI. */
@@ -165,12 +168,18 @@ function encodeMedia(bytes: Uint8Array, mime: string, name: string): MediaFile {
   };
 }
 
+/** What the browser can say about a clip or a track without decoding it all. */
+type ProbedMedia = { seconds?: number; width?: number; height?: number };
+
 /**
- * Read a clip's length without keeping an element around.
+ * Read a clip's length and shape without keeping an element around.
  * MediaRecorder WebMs often report `Infinity` until they are seeked once, so
- * the probe nudges the element and waits for `durationchange`.
+ * the probe nudges the element and waits for `durationchange`. A clip's
+ * dimensions come off the same loaded-metadata event: the motion reference
+ * decides the render's ratio, so the file's own shape has to be read before
+ * the panel can show it.
  */
-function probeSeconds(src: string, kind: "audio" | "video"): Promise<number | undefined> {
+function probeMedia(src: string, kind: "audio" | "video"): Promise<ProbedMedia> {
   return new Promise((resolve) => {
     const element = document.createElement(kind === "video" ? "video" : "audio");
     let settled = false;
@@ -179,6 +188,8 @@ function probeSeconds(src: string, kind: "audio" | "video"): Promise<number | un
     const finish = (value?: number) => {
       if (settled) return;
       settled = true;
+      const width = element instanceof HTMLVideoElement ? element.videoWidth : 0;
+      const height = element instanceof HTMLVideoElement ? element.videoHeight : 0;
       window.clearTimeout(timer);
       element.removeEventListener("loadedmetadata", onMeta);
       element.removeEventListener("durationchange", attempt);
@@ -187,7 +198,10 @@ function probeSeconds(src: string, kind: "audio" | "video"): Promise<number | un
       element.removeEventListener("error", fail);
       element.removeAttribute("src");
       element.load();
-      resolve(value);
+      resolve({
+        ...(value && Number.isFinite(value) ? { seconds: value } : {}),
+        ...(width > 0 && height > 0 ? { width, height } : {}),
+      });
     };
     const attempt = () => {
       if (Number.isFinite(element.duration) && element.duration > 0) finish(element.duration);
@@ -230,11 +244,12 @@ export async function prepareMedia(file: File, maxMb = MAX_MEDIA_MB, seconds?: n
   const mime = mediaMime(file.name, file.type);
   const encoded = encodeMedia(bytes, mime, file.name);
 
-  if (seconds && Number.isFinite(seconds)) return { ...encoded, seconds };
-
   const kind = mime.startsWith("video/") ? "video" : mime.startsWith("audio/") ? "audio" : undefined;
   if (!kind) return encoded;
-  return { ...encoded, seconds: await probeSeconds(encoded.dataUrl, kind) };
+  // A known length is not a shape: a clip's aspect comes off the file itself,
+  // so the probe runs even when the caller already knows the seconds.
+  const probed = await probeMedia(encoded.dataUrl, kind);
+  return { ...encoded, ...probed, ...(seconds && Number.isFinite(seconds) ? { seconds } : {}) };
 }
 
 /** Reuse a clip or track already in the library through its URL. */
@@ -255,10 +270,25 @@ export async function mediaFromSrc(
   if (!/^(audio|video)\//i.test(mime)) throw new Error("That asset is not audio or video.");
 
   const encoded = encodeMedia(new Uint8Array(await blob.arrayBuffer()), mime, name);
-  if (seconds && Number.isFinite(seconds)) return { ...encoded, seconds };
-
   const kind = mime.startsWith("video/") ? "video" : "audio";
-  return { ...encoded, seconds: await probeSeconds(encoded.dataUrl, kind) };
+  const probed = await probeMedia(encoded.dataUrl, kind);
+  return { ...encoded, ...probed, ...(seconds && Number.isFinite(seconds) ? { seconds } : {}) };
+}
+
+/**
+ * A library clip or track as a File, so it can go through the clip editor.
+ *
+ * The library keeps bytes in IndexedDB (or a render's own blob), not as a
+ * File, so the editor cannot seek or re-record one until it is re-wrapped.
+ */
+export async function fileFromSrc(src: string, name: string, maxMb = MAX_MEDIA_MB): Promise<File> {
+  const blob = await getMediaBlob(src);
+  if (!blob) throw new Error("Could not read that file.");
+
+  const mb = blob.size / (1024 * 1024);
+  if (mb > maxMb) throw new Error(`That file is ${mb.toFixed(1)} MB. Keep it under ${maxMb} MB.`);
+
+  return new File([blob], name, { type: mediaMime(name, blob.type) });
 }
 
 /**

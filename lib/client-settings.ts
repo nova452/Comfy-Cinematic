@@ -29,7 +29,10 @@ export type StoredAccount = {
 
 export type StoredSettings = {
   account?: StoredAccount;
+  /** MiniMax H3 Local's own settings (the plain H3 stack). */
   localModel?: LocalModelConfig;
+  /** Openjutsu's own settings (the ref5 graph), split from `localModel`. */
+  openjutsu?: LocalModelConfig;
   localImage?: LocalImageModelConfig;
 };
 
@@ -68,12 +71,34 @@ export function normalizeStoredAccount(raw: unknown): StoredAccount | undefined 
   };
 }
 
+/** A stored local config with the OpenRouter key dropped. */
+function withoutOpenRouterKey(raw: unknown) {
+  const value = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  return localModelConfig({ ...value, openRouterKey: undefined });
+}
+
+/**
+ * A saved config that still carries an OpenRouter key, if any.
+ *
+ * Before the two local video rows had separate gears, Openjutsu's key lived in
+ * `localModel`. Reading it here moves that key into its own record, so each
+ * model's gear edits only its own settings from now on.
+ */
+function legacyOpenjutsu(raw: unknown) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const key = typeof value.openRouterKey === "string" ? value.openRouterKey.trim() : "";
+  return key ? value : undefined;
+}
+
 export function normalizeStoredSettings(raw: unknown): StoredSettings {
   const value = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const account = normalizeStoredAccount(value.account);
+  const openjutsu = value.openjutsu ?? legacyOpenjutsu(value.localModel);
   return {
     ...(account ? { account } : {}),
-    ...(value.localModel ? { localModel: localModelConfig(value.localModel) } : {}),
+    ...(value.localModel ? { localModel: withoutOpenRouterKey(value.localModel) } : {}),
+    ...(openjutsu ? { openjutsu: localModelConfig(openjutsu) } : {}),
     ...(value.localImage ? { localImage: localImageModelConfig(value.localImage) } : {}),
   };
 }
@@ -118,6 +143,11 @@ export function forgetAccount() {
 
 export function rememberLocalModel(config: LocalModelConfig) {
   writeSettings({ ...readSettings(), localModel: localModelConfig(config) });
+}
+
+/** Keep Openjutsu's settings, replacing the last ones. */
+export function rememberOpenjutsu(config: LocalModelConfig) {
+  writeSettings({ ...readSettings(), openjutsu: localModelConfig(config) });
 }
 
 export function rememberLocalImage(config: LocalImageModelConfig) {

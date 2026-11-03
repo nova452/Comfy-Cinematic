@@ -7,13 +7,13 @@
  * Nothing is sent to the server to be kept.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { deleteRecord, getRecord, MEDIA_STORE, putRecord, requestPersistence } from "./browser-db.ts";
 
 const PREFIX = "media:";
 
 /** 1×1 transparent GIF: what a tile shows while its blob is being read. */
-const PLACEHOLDER =
+export const PLACEHOLDER =
   "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 
 const EXTENSIONS: Record<string, string> = {
@@ -51,10 +51,38 @@ const urls = new Map<string, string>();
 const loading = new Set<string>();
 const listeners = new Set<() => void>();
 let version = 0;
+let flushing = false;
 
+/**
+ * Tell listeners a blob landed — once per frame's worth, not once per blob. A library
+ * of a few hundred tiles otherwise re-renders the workspace a few hundred times
+ * in a row as their reads come back.
+ */
 function announce() {
   version += 1;
-  for (const listener of listeners) listener();
+  if (flushing) return;
+  flushing = true;
+  const flush = () => {
+    flushing = false;
+    for (const listener of listeners) listener();
+  };
+  // A timer rather than requestAnimationFrame, which never fires while the
+  // window is hidden and would leave tiles blank until it is shown again.
+  setTimeout(flush, 16);
+}
+
+function subscribe(listener: () => void) {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+/** What `mediaUrl` would return right now, without starting a read. */
+function peekUrl(src: string | undefined) {
+  if (!src) return PLACEHOLDER;
+  if (!isMediaSrc(src)) return src;
+  return urls.get(idOf(src)) ?? PLACEHOLDER;
 }
 
 export function isMediaSrc(src: string | undefined) {
@@ -173,12 +201,26 @@ export async function deleteMedia(sources: (string | undefined)[]) {
 /** Re-render whenever a blob lands, so tiles fill in as they load. */
 export function useMediaVersion() {
   const [, setTick] = useState(0);
-  useEffect(() => {
-    const listener = () => setTick((tick) => tick + 1);
-    listeners.add(listener);
-    return () => {
-      listeners.delete(listener);
-    };
-  }, []);
+  useEffect(() => subscribe(() => setTick((tick) => tick + 1)), []);
   return version;
+}
+
+/**
+ * One source's URL, re-rendering only the component that asked and only when
+ * that source's blob lands — unlike `useMediaVersion`, which wakes the whole
+ * tree for every blob.
+ *
+ * Nothing is read while `enabled` is false, so a tile can wait until it is
+ * near the screen before pulling its bytes out of IndexedDB.
+ */
+export function useMediaUrl(src: string | undefined, enabled = true): string {
+  useEffect(() => {
+    if (enabled) mediaUrl(src);
+  }, [src, enabled]);
+  const url = useSyncExternalStore(
+    subscribe,
+    () => peekUrl(src),
+    () => (isMediaSrc(src) ? PLACEHOLDER : peekUrl(src)),
+  );
+  return enabled ? url : PLACEHOLDER;
 }

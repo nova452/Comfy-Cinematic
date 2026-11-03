@@ -17,6 +17,15 @@ test("the chat prompt knows the app and forbids rendering", () => {
   // The ids are read from the same tables the pickers use, so they cannot drift.
   assert.ok(STUDIO_SYSTEM_PROMPT.includes("21:9"));
   assert.ok(STUDIO_SYSTEM_PROMPT.includes("minimax/minimax-h3"));
+  // The newer pipeline is described, not just named: Openjutsu's default
+  // Light pass, the key toggle, the off-by-default upscale, the clip editor
+  // minimum and the reviewer shortcut.
+  assert.ok(STUDIO_SYSTEM_PROMPT.includes("Openjutsu Prime"));
+  assert.ok(STUDIO_SYSTEM_PROMPT.includes("Light, the default"));
+  assert.ok(STUDIO_SYSTEM_PROMPT.includes("API key toggle"));
+  assert.ok(STUDIO_SYSTEM_PROMPT.includes("Upscale 2x is off by default"));
+  assert.ok(STUDIO_SYSTEM_PROMPT.includes("at least 5 seconds"));
+  assert.ok(STUDIO_SYSTEM_PROMPT.includes("/openjutsu-prime?key="));
   assert.equal(/—/.test(STUDIO_SYSTEM_PROMPT), false);
 });
 
@@ -88,7 +97,10 @@ test("a plan keeps only the fields it was given", () => {
 
 test("infers the tab when the model forgets it", () => {
   assert.deepEqual(planFromRaw({ prompt: "a fox" }), { tab: "create", prompt: "a fox" });
-  assert.deepEqual(planFromRaw({ mode: "free" }), { tab: "video", mode: "free" });
+  // The panel opens on Openjutsu, which has no Free mode: the tab still comes
+  // from the mode, but a mode that model cannot take is dropped.
+  assert.deepEqual(planFromRaw({ mode: "free" }), { tab: "video" });
+  assert.deepEqual(planFromRaw({ mode: "video" }), { tab: "video", mode: "video" });
   assert.equal(planFromRaw({}), undefined);
   assert.equal(planFromRaw({ tab: "settings" }), undefined);
 });

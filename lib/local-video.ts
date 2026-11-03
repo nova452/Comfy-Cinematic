@@ -22,6 +22,11 @@
  * `LoadAudio` node, or from the audio output of the `GetVideoComponents` node
  * that also supplies the motion reference's frames. Only a free render — or a
  * silent motion reference — decodes H3's audio latents.
+ *
+ * Openjutsu is the exception to all of the above: its Video Reference renders
+ * run the ref5 graph in `lib/ref5.ts` (character sheets, border check, a prompt
+ * model inside the graph, two sampling passes). Only a continuation keeps the
+ * plain stack, since it renders past the clip rather than editing it.
  */
 
 import { Comfy } from "@comfyorg/sdk";
@@ -30,17 +35,32 @@ import {
   LOCAL_MODEL_DEFAULTS,
   MAX_DURATION,
   MIN_DURATION,
+  OPENJUTSU_DEFAULTS,
   localModelConfig,
   type LocalModelConfig,
+  type OpenjutsuMode,
+  type OpenjutsuPromptApi,
   type VideoMode,
   type VideoResolution,
 } from "./video.ts";
 
 /** H3 renders at 24 fps. */
-import { redirectMode } from "./account.ts";
-import type { RenderProgress } from "./render-progress.ts";
+import { envOpenRouterKey, redirectMode } from "./account.ts";
+import { buildRef5Graph } from "./ref5.ts";
+import { CANCELLED_MESSAGE, type RenderProgress } from "./render-progress.ts";
+import { RenderTimer, formatTimingSummary, formatTimingTimeline, type TimingSegment } from "./render-timing.ts";
 
 export const LOCAL_FPS = 24;
+
+/** How long a plain local render may take. */
+const LOCAL_TIMEOUT_MS = 840_000;
+/**
+ * Openjutsu Prime's graph does far more: up to eight character sheets, a
+ * high-reasoning prompt model, two sampling passes and, when on, a 2x upscale
+ * pass, and, in Quality, a dummy pass before them. The route's own
+ * `maxDuration` leaves room for its uploads and download around this.
+ */
+export const OPENJUTSU_TIMEOUT_MS = 35 * 60_000;
 /** H3 wants a few frames past the whole second, as its own graphs do. */
 const TAIL_FRAMES = 4;
 
@@ -56,6 +76,21 @@ export type LocalVideoFiles = {
   steps: number;
   /** Cap on the motion reference's short edge, or 0/undefined for the output's. */
   refVideoEdge?: number;
+  /** OpenRouter key for the ref5 graph's prompt, decision and spatial models. */
+  openRouterKey?: string;
+  /** Openjutsu's pipeline: `quality` adds the colour pass and second prompt call; `light` does not. */
+  openjutsuMode?: OpenjutsuMode;
+  /** Openjutsu: `true` adds the 2x upscale pass; off (the default) saves the finished pass as it is. */
+  upscale?: boolean;
+  /** Openjutsu's prompt model: Comfy Router Gemini (default) or the OpenRouter node. */
+  promptApi?: OpenjutsuPromptApi;
+  /** Openjutsu's second pass: the ref2va checkpoint and Pika LoRA from the gear's Extras. */
+  ref2vaUnet?: string;
+  ref2vaLora?: string;
+  /** Openjutsu's upscale pass: the latent upscaler from the gear's Extras. */
+  latentUpscaler?: string;
+  /** Openjutsu's upscale pass: the refiner LoRA from Extras, or found by verify. */
+  refinerLora?: string;
 };
 
 /**
@@ -107,6 +142,12 @@ export type LocalVideoInput = {
   duration: number;
   /** Reference images, as data URIs. */
   images?: string[];
+  /** Openjutsu: Video Reference runs the ref5 graph (`lib/ref5.ts`). */
+  openjutsu?: boolean;
+  /** ref5 only: the user wrote no prompt, so the prompt model plans the edit. */
+  auto?: boolean;
+  /** ref5 only: seconds into `video` where the clip starts; `duration` is its length. */
+  start?: number;
   /** First frame, as a data URI. Free mode only; selects the i2v graph. */
   firstFrame?: string;
   /** Last frame, as a data URI. Free mode only; selects the i2v graph. */
@@ -139,10 +180,18 @@ export type LocalVideoPlan = {
   height: number;
   frames: number;
   /**
-   * Where the finished clip's sound comes from: `reference` when the upload's
-   * own track is carried through, `generated` when H3's latents are decoded.
+   * The save node for the pre-upscale clip, set only when the upscale pass
+   * runs. The runner falls back to it if the upscale fails.
    */
-  audioSource: "reference" | "generated";
+  fallbackNode?: string;
+  /**
+   * Where the finished clip's sound comes from: `reference` when the upload's
+   * own track is carried through, `generated` when H3's latents are decoded,
+   * `silent` when a ref5 render's clip had no track to carry.
+   */
+  audioSource: "reference" | "generated" | "silent";
+  /** A node whose text output is the prompt H3 rendered, when the graph wrote one. */
+  promptNode?: string;
 };
 
 /**
@@ -183,7 +232,20 @@ export function localFiles(config: LocalModelConfig, env: NodeJS.ProcessEnv = pr
     audioVae: env.H3_VAE_AUDIO?.trim() || DEFAULT_LOCAL_FILES.audioVae,
     steps: config.steps,
     refVideoEdge: config.refVideoEdge,
+    openRouterKey: config.openRouterKey || envOpenRouterKey(env),
+    openjutsuMode: config.openjutsuMode,
+    upscale: config.upscale,
+    promptApi: config.promptApi,
+    ref2vaUnet: config.ref2vaUnet,
+    ref2vaLora: config.ref2vaLora,
+    latentUpscaler: config.latentUpscaler,
+    refinerLora: config.refinerLora,
   };
+}
+
+/** Whether a local render takes the ref5 graph rather than the plain reference stack. */
+export function usesRef5(input: Pick<LocalVideoInput, "openjutsu" | "mode" | "continuation">) {
+  return Boolean(input.openjutsu) && input.mode === "video" && !input.continuation;
 }
 
 /**
@@ -219,6 +281,23 @@ export function buildLocalVideoGraph(
   files: LocalVideoFiles = DEFAULT_LOCAL_FILES,
   seed = 42,
 ): LocalVideoPlan {
+  if (usesRef5(input) && input.video) {
+    // Only the OpenRouter API calls out of ComfyUI; without a key its node
+    // answers with an error string, the regex finds no prompt in it, and H3
+    // renders from nothing. The Gemini API uses the target's own auth, and
+    // Light's border check is off without a key.
+    const promptApi = files.promptApi ?? OPENJUTSU_DEFAULTS.promptApi;
+    if (promptApi === "openrouter" && !files.openRouterKey) {
+      throw new Error("Openjutsu Prime needs an OpenRouter key (the model's gear, or OPENROUTER_API_KEY).");
+    }
+    const bytes = dataUriBytes(input.video);
+    return buildRef5Graph(input, files, seed, {
+      openRouterKey: files.openRouterKey,
+      sourceSize: bytes && mp4VideoSize(bytes),
+      sourceAudio: bytes ? hasAudioTrack(bytes) : false,
+    });
+  }
+
   const { width, height } = localDimensions(input.ratio, input.resolution);
   const frames = localFrames(input.duration);
   // A first or last frame is a Free-mode keyframe (the route refuses them in
@@ -494,7 +573,27 @@ export function splitDataUri(
   return { bytes, filename: `${name}.${extension}`, contentType };
 }
 
-export type LocalVideoResult = { bytes: Uint8Array; contentType: string; requestId: string | null };
+export type LocalVideoResult = {
+  bytes: Uint8Array;
+  contentType: string;
+  requestId: string | null;
+  /** The prompt the graph wrote for H3, when it wrote one and it could be read. */
+  prompt?: string;
+  /** Where the render's time went, stage by stage (see `render-timing.ts`). */
+  timing?: TimingSegment[];
+  /** True when the upscale pass failed and the pre-upscale clip was kept instead. */
+  fallback?: boolean;
+  /** The upscale's own failure, when `fallback` is set. */
+  warning?: string;
+};
+
+/** A `PreviewAny` node's text, out of a classic history entry's `outputs`. */
+export function classicText(outputs: unknown, nodeId: string | undefined): string | undefined {
+  if (!nodeId) return undefined;
+  const text = field(field(outputs, nodeId), "text");
+  const first = Array.isArray(text) ? text[0] : text;
+  return typeof first === "string" && first.trim() ? first.trim() : undefined;
+}
 
 /** One stage report from a running render; see `lib/render-progress.ts`. */
 export type LocalProgressUpdate = Omit<RenderProgress, "startedAt" | "updatedAt">;
@@ -644,12 +743,55 @@ export function classicError(body: unknown): string | undefined {
   const error = field(body, "error");
   if (typeof error === "string" && error) return error;
   if (error && typeof error === "object") {
+    const missing = missingNodeError(error);
+    if (missing) return missing;
     const parts = [field(error, "message"), field(error, "details")].filter(
       (part): part is string => typeof part === "string" && part.length > 0,
     );
     if (parts.length > 0) return parts.join(": ");
   }
   return undefined;
+}
+
+/**
+ * A refusal over a node type the target does not have, said by name.
+ *
+ * ComfyUI's own words are "Node '…' not found" with the node's id as the
+ * details, and a deployment can pass on only `Node ID '#26'`; the class name
+ * rides beside them (`class_type`, or `extra_info.class_type`), and it is the
+ * one thing that says which custom node pack to install.
+ */
+export function missingNodeError(error: unknown): string | undefined {
+  const extra = field(error, "extra_info");
+  const classType = field(error, "class_type") ?? field(extra, "class_type");
+  if (typeof classType !== "string" || !classType) return undefined;
+
+  const words = [field(error, "code"), field(error, "type"), field(error, "message"), field(error, "details")]
+    .filter((part): part is string => typeof part === "string")
+    .join(" ");
+  if (!/missing_node|not found|does not exist|not installed|unknown node|node id '#/i.test(words)) return undefined;
+
+  const id = field(error, "node_id") ?? field(extra, "node_id");
+  const node = typeof id === "string" || typeof id === "number" ? ` (node #${String(id).replace(/^#/, "")})` : "";
+  return `Your ComfyUI has no ${classType} node${node}. Install the custom node pack that provides it, then restart ComfyUI.`;
+}
+
+/**
+ * A bare `Node ID '#310'` refusal, with the class read off the submitted graph.
+ *
+ * Some deployments pass on nothing but that id; the graph knows what it is.
+ */
+export function explainNodeId(error: unknown, graph: LocalGraph): unknown {
+  if (!(error instanceof Error)) return error;
+  const match = /^\s*Node ID '#?([^']+)'\s*$/.exec(error.message);
+  const node = match ? graph[match[1]!] : undefined;
+  if (!node) return error;
+  const better = new Error(
+    `Your ComfyUI rejected node #${match![1]} (${node.class_type}). If that node type is missing, install the custom node pack that provides it, then restart ComfyUI.`,
+  );
+  const requestId = Reflect.get(error, "requestId");
+  if (typeof requestId === "string") Reflect.set(better, "requestId", requestId);
+  return better;
 }
 
 /**
@@ -662,12 +804,15 @@ export function classicError(body: unknown): string | undefined {
  */
 export function localFailure(error: unknown): unknown {
   if (!(error instanceof Error)) return error;
-  const inner = Reflect.get(error, "error") as
+  // A failed job carries ComfyUI's refusal on `error`; a refused submission
+  // carries it on `details`.
+  const inner = (Reflect.get(error, "error") ?? Reflect.get(error, "details")) as
     | { message?: unknown; node_errors?: unknown }
+    | null
     | undefined;
   if (!inner || typeof inner !== "object") return error;
 
-  const details = classicError({ node_errors: inner.node_errors });
+  const details = classicError({ node_errors: inner.node_errors }) ?? missingNodeError(inner);
   const message = details ?? (typeof inner.message === "string" ? inner.message : undefined);
   if (!message) return error;
 
@@ -675,6 +820,21 @@ export function localFailure(error: unknown): unknown {
   const requestId = Reflect.get(error, "requestId");
   if (typeof requestId === "string") Reflect.set(better, "requestId", requestId);
   return better;
+}
+
+/**
+ * The body a classic ComfyUI's `/prompt` takes.
+ *
+ * Partner nodes (the Gemini prompt call) read their Comfy key from
+ * `extra_data.api_key_comfy_org`; without it they answer 401. The key is only
+ * sent when there is one, so an ordinary render adds no `extra_data` at all.
+ */
+export function classicPromptBody(graph: LocalGraph, clientId: string, orgKey?: string) {
+  return {
+    prompt: graph,
+    client_id: clientId,
+    ...(orgKey ? { extra_data: { api_key_comfy_org: orgKey } } : {}),
+  };
 }
 
 /** A run that failed inside the graph, read off its history status. */
@@ -735,9 +895,95 @@ export function classicViewUrl(endpoint: string, ref: ClassicFileRef) {
   return `${base}/view?${query.toString()}`;
 }
 
+/**
+ * The clip a failed run saved before its upscale pass.
+ *
+ * The graph saves the finished pass first and the upscale reads it, so a
+ * failed upscale leaves that file behind even though the prompt is reported
+ * failed. Missing, unreadable or empty means there is nothing to fall back to.
+ */
+async function classicFallback(
+  base: string,
+  headers: Record<string, string>,
+  outputs: unknown,
+  plan: LocalVideoPlan,
+  promptId: string,
+  failure: string,
+): Promise<LocalVideoResult | undefined> {
+  const ref = classicVideoRef(outputs, plan.fallbackNode);
+  if (!ref) return undefined;
+  try {
+    const download = await fetch(classicViewUrl(base, ref), {
+      headers,
+      cache: "no-store",
+      signal: AbortSignal.timeout(180_000),
+      redirect: redirectMode(),
+    });
+    if (!download.ok) return undefined;
+    const bytes = new Uint8Array(await download.arrayBuffer());
+    if (bytes.byteLength === 0) return undefined;
+    const prompt = classicText(outputs, plan.promptNode);
+    return {
+      bytes,
+      contentType: download.headers.get("content-type") ?? "video/mp4",
+      requestId: promptId,
+      ...(prompt ? { prompt } : {}),
+      fallback: true,
+      warning: failure,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 /** Node has no `timers/promises` import here; one tiny wait is enough. */
 function wait(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+/** A wait that a cancel cuts short. */
+export function pause(ms: number, signal?: AbortSignal) {
+  if (!signal) return wait(ms);
+  return new Promise<void>((resolve) => {
+    if (signal.aborted) return resolve();
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
+/** A request's own deadline, joined with the render's cancel when it has one. */
+export function deadline(ms: number, signal?: AbortSignal) {
+  return signal ? AbortSignal.any([signal, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
+}
+
+/** What a cancelled render throws; the route answers with these words. */
+export function cancelled() {
+  return new Error(CANCELLED_MESSAGE);
+}
+
+/**
+ * Stop a prompt on a bare ComfyUI: interrupt it if it is the one running,
+ * and drop it from the queue if it is still waiting. Best effort — the render
+ * is being abandoned either way.
+ */
+export async function classicCancel(base: string, headers: Record<string, string>, promptId: string) {
+  const post = (path: string, body?: unknown) =>
+    fetch(`${base}${path}`, {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify(body ?? {}),
+      signal: AbortSignal.timeout(10_000),
+      redirect: redirectMode(),
+    }).catch(() => undefined);
+  // `prompt_id` scopes the interrupt on current ComfyUI; older ones interrupt
+  // whatever is running, which is this prompt or nothing worth keeping.
+  await post("/interrupt", { prompt_id: promptId });
+  await post("/queue", { delete: [promptId] });
 }
 
 /**
@@ -752,6 +998,8 @@ async function runClassicVideo(
   plan: LocalVideoPlan,
   timeoutMs: number,
   onProgress?: OnLocalProgress,
+  signal?: AbortSignal,
+  orgKey?: string,
 ): Promise<LocalVideoResult> {
   const base = endpoint.replace(/\/+$/, "");
   if (plan.uploads.length > 0) onProgress?.({ stage: "uploading" });
@@ -774,7 +1022,8 @@ async function runClassicVideo(
       method: "POST",
       headers,
       body: form,
-      signal: AbortSignal.timeout(120_000),
+      // Before the prompt exists a cancel only has to stop this request.
+      signal: deadline(120_000, signal),
       redirect: redirectMode(),
     });
     if (!response.ok) {
@@ -786,7 +1035,9 @@ async function runClassicVideo(
   const submit = await fetch(`${base}/prompt`, {
     method: "POST",
     headers: { ...headers, "content-type": "application/json" },
-    body: JSON.stringify({ prompt: graph, client_id: `cinematic-${Date.now()}` }),
+    body: JSON.stringify(classicPromptBody(graph, `cinematic-${Date.now()}`, orgKey)),
+    // Not the cancel: a submit cut off midway could leave a queued prompt
+    // with no id to stop it by. The loop below checks right after.
     signal: AbortSignal.timeout(60_000),
     redirect: redirectMode(),
   });
@@ -803,8 +1054,12 @@ async function runClassicVideo(
   // reports no steps: the tile says "Rendering" until the clip is fetched.
   onProgress?.({ stage: "running" });
 
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const giveUpAt = Date.now() + timeoutMs;
+  while (Date.now() < giveUpAt) {
+    if (signal?.aborted) {
+      await classicCancel(base, headers, promptId);
+      throw cancelled();
+    }
     const response = await fetch(`${base}/history/${encodeURIComponent(promptId)}`, {
       headers,
       cache: "no-store",
@@ -815,10 +1070,15 @@ async function runClassicVideo(
     const entry = field(history, promptId);
 
     if (entry && typeof entry === "object") {
+      const outputs = field(entry, "outputs");
       const failure = classicRunError(entry);
-      if (failure) throw new Error(failure);
+      if (failure) {
+        const fallback = await classicFallback(base, headers, outputs, plan, promptId, failure);
+        if (fallback) return fallback;
+        throw new Error(failure);
+      }
 
-      const ref = classicVideoRef(field(entry, "outputs"));
+      const ref = classicVideoRef(outputs);
       if (ref) {
         onProgress?.({ stage: "downloading" });
         const download = await fetch(classicViewUrl(base, ref), {
@@ -830,20 +1090,31 @@ async function runClassicVideo(
         if (!download.ok) throw new Error(`Could not download the clip (HTTP ${download.status}).`);
         const bytes = new Uint8Array(await download.arrayBuffer());
         if (bytes.byteLength === 0) throw new Error("The local render came back empty.");
+        const prompt = classicText(outputs, plan.promptNode);
         return {
           bytes,
           contentType: download.headers.get("content-type") ?? "video/mp4",
           requestId: promptId,
+          ...(prompt ? { prompt } : {}),
         };
       }
 
       // Finished, but the save node reported nothing to fetch.
       if (field(field(entry, "status"), "completed") === true) {
+        const fallback = await classicFallback(
+          base,
+          headers,
+          outputs,
+          plan,
+          promptId,
+          "The graph finished without its upscaled clip.",
+        );
+        if (fallback) return fallback;
         throw new Error("The local graph finished without a video output.");
       }
     }
 
-    await wait(1_500);
+    await pause(1_500, signal);
   }
 
   throw new Error(`The local render did not finish within ${Math.round(timeoutMs / 1000)}s.`);
@@ -867,29 +1138,65 @@ function clientFor(endpoint: string, apiKey?: string) {
   }
 }
 
+type LocalRunOptions = {
+  files?: LocalVideoFiles;
+  seed?: number;
+  apiKey?: string;
+  /** A Comfy deployment (Settings). Falls back to COMFY_BASE_URL. */
+  baseUrl?: string;
+  /** Model / clip / steps from the picker's configuration dialog. */
+  config?: LocalModelConfig;
+  timeoutMs?: number;
+  /** Skip the probe when the caller already knows the surface. */
+  surface?: LocalSurface;
+  /** Stage and step reports while the render runs. */
+  onProgress?: OnLocalProgress;
+  /** A tile's ✕: stops the job on the target and throws `Cancelled.`. */
+  signal?: AbortSignal;
+  /**
+   * The signed-in Comfy Router key, forwarded as `extra_data.api_key_comfy_org`
+   * so partner/API nodes (the Gemini prompt call) can authenticate.
+   */
+  orgKey?: string;
+};
+
 /**
  * Run one render on the local ComfyUI.
  *
  * Throws with a readable message when the endpoint is missing or the job
  * fails; the route turns that into a 5xx the panel can show.
+ *
+ * Every render is timed from its own progress reports: the breakdown is
+ * logged on the server when it ends, failed or not, and returned with the
+ * clip.
  */
-export async function runLocalVideo(
-  input: LocalVideoInput,
-  options: {
-    files?: LocalVideoFiles;
-    seed?: number;
-    apiKey?: string;
-    /** A Comfy deployment (Settings). Falls back to COMFY_BASE_URL. */
-    baseUrl?: string;
-    /** Model / clip / steps from the picker's configuration dialog. */
-    config?: LocalModelConfig;
-    timeoutMs?: number;
-    /** Skip the probe when the caller already knows the surface. */
-    surface?: LocalSurface;
-    /** Stage and step reports while the render runs. */
-    onProgress?: OnLocalProgress;
-  } = {},
-): Promise<LocalVideoResult> {
+export async function runLocalVideo(input: LocalVideoInput, options: LocalRunOptions = {}): Promise<LocalVideoResult> {
+  const timer = new RenderTimer();
+  timer.mark({ stage: "submitting" });
+  const onProgress: OnLocalProgress = (update) => {
+    timer.mark(update);
+    options.onProgress?.(update);
+  };
+  const mode = options.files?.openjutsuMode ?? options.config?.openjutsuMode ?? OPENJUTSU_DEFAULTS.mode;
+  const label = usesRef5(input) ? `Openjutsu Prime (${mode})` : "Local render";
+  try {
+    const result = await runTimed(input, { ...options, onProgress });
+    const timing = timer.finish();
+    logTiming(label, "done", timing);
+    return { ...result, timing };
+  } catch (error) {
+    logTiming(label, options.signal?.aborted ? "cancelled" : "failed", timer.finish());
+    throw error;
+  }
+}
+
+/** One line for the server log, and one with every segment in order. */
+function logTiming(label: string, outcome: string, timing: TimingSegment[]) {
+  console.info(`[timing] ${label} ${outcome}. ${formatTimingSummary(timing)}`);
+  console.info(`[timing]   ${formatTimingTimeline(timing)}`);
+}
+
+async function runTimed(input: LocalVideoInput, options: LocalRunOptions): Promise<LocalVideoResult> {
   const endpoint = options.baseUrl?.trim() || localEndpoint();
   if (!endpoint) {
     throw new Error(
@@ -897,6 +1204,7 @@ export async function runLocalVideo(
     );
   }
 
+  const timeoutMs = options.timeoutMs ?? (usesRef5(input) ? OPENJUTSU_TIMEOUT_MS : LOCAL_TIMEOUT_MS);
   const plan = buildLocalVideoGraph(
     input,
     options.files ?? localFiles(options.config ?? localModelConfig(undefined)),
@@ -906,7 +1214,17 @@ export async function runLocalVideo(
   // A bare ComfyUI has no /api/v2; ask once, then submit the way it expects.
   const surface = options.surface ?? (await detectLocalSurface(endpoint, options.apiKey));
   if (surface === "classic") {
-    return runClassicVideo(endpoint, options.apiKey, plan, options.timeoutMs ?? 840_000, options.onProgress);
+    return runClassicVideo(
+      endpoint,
+      options.apiKey,
+      plan,
+      timeoutMs,
+      options.onProgress,
+      options.signal,
+      options.orgKey,
+    ).catch((error: unknown) => {
+      throw explainNodeId(error, plan.graph);
+    });
   }
 
   const client = clientFor(endpoint, options.apiKey);
@@ -920,31 +1238,85 @@ export async function runLocalVideo(
 
   // Submit and wait apart, rather than `client.run`, so the job's id is known
   // while it runs and its record can be followed for the tile's progress.
-  const { onProgress } = options;
+  const { onProgress, signal } = options;
   if (plan.uploads.length > 0) onProgress?.({ stage: "uploading" });
-  const job = await client.submit(workflow).catch((error: unknown) => {
-    throw localFailure(error);
-  });
+  const job = await client
+    .submit(workflow, options.orgKey ? { apiKey: options.orgKey } : undefined)
+    .catch((error: unknown) => {
+      throw explainNodeId(localFailure(error), plan.graph);
+    });
   onProgress?.({ stage: "queued" });
 
   const following = new AbortController();
   if (onProgress) void followJob(endpoint.replace(/\/+$/, ""), job.id, options.apiKey, onProgress, following.signal);
   try {
-    await job.wait(options.timeoutMs ?? 840_000);
+    await job.wait(timeoutMs, signal);
     // Terminal now; this throws the job's own failure unless it succeeded.
     await job.result();
   } catch (error) {
-    throw localFailure(error);
+    // A cancel lands here as the wait's abort: stop the job too, so the
+    // deployment is not left rendering a clip nobody will collect.
+    if (signal?.aborted) {
+      await job.cancel().catch(() => undefined);
+      throw cancelled();
+    }
+    const fallback = await jobFallback(job, plan, localFailure(error));
+    if (fallback) return fallback;
+    throw explainNodeId(localFailure(error), plan.graph);
   } finally {
     following.abort();
   }
 
   const [output] = job.getOutputs(LOCAL_SAVE_NODE);
-  if (!output) throw new Error("The local graph produced no video output.");
+  if (!output) {
+    const fallback = await jobFallback(job, plan, new Error("The local graph produced no video output."));
+    if (fallback) return fallback;
+    throw new Error("The local graph produced no video output.");
+  }
 
   onProgress?.({ stage: "downloading" });
   const bytes = await output.toBytes();
   if (bytes.byteLength === 0) throw new Error("The local render came back empty.");
 
-  return { bytes, contentType: "video/mp4", requestId: job.id ?? null };
+  const prompt = await jobText(job, plan.promptNode);
+  return { bytes, contentType: "video/mp4", requestId: job.id ?? null, ...(prompt ? { prompt } : {}) };
+}
+
+/** The pre-upscale clip a failed v2 job saved before its upscale pass. */
+async function jobFallback(
+  job: { id?: string; getOutputs(nodeId: string): { toBytes(): Promise<Uint8Array> }[] },
+  plan: LocalVideoPlan,
+  error: unknown,
+): Promise<LocalVideoResult | undefined> {
+  if (!plan.fallbackNode) return undefined;
+  try {
+    const [output] = job.getOutputs(plan.fallbackNode);
+    if (!output) return undefined;
+    const bytes = await output.toBytes();
+    if (bytes.byteLength === 0) return undefined;
+    const prompt = await jobText(job, plan.promptNode);
+    return {
+      bytes,
+      contentType: "video/mp4",
+      requestId: job.id ?? null,
+      ...(prompt ? { prompt } : {}),
+      fallback: true,
+      warning: error instanceof Error ? error.message : "The upscale pass failed.",
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** A text output of a finished v2 job; a missing one is not a failed render. */
+async function jobText(job: { getOutputs(nodeId: string): { toBytes(): Promise<Uint8Array> }[] }, nodeId?: string) {
+  if (!nodeId) return undefined;
+  try {
+    const [output] = job.getOutputs(nodeId);
+    if (!output) return undefined;
+    const text = new TextDecoder().decode(await output.toBytes()).trim();
+    return text || undefined;
+  } catch {
+    return undefined;
+  }
 }

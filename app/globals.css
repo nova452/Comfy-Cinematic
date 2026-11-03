@@ -348,6 +348,7 @@ code {
 }
 
 .project-thumb {
+  position: relative;
   display: grid;
   place-items: center;
   aspect-ratio: 16 / 10;
@@ -357,10 +358,27 @@ code {
   overflow: hidden;
 }
 
-.project-thumb img {
+.project-thumb img,
+.project-thumb video {
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+/* A clip's thumb is a still of the clip; the mark says it moves. */
+.project-play {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: rgba(27, 20, 33, 0.78);
+  color: var(--lime);
+  backdrop-filter: blur(3px);
+  pointer-events: none;
 }
 
 .project-blank {
@@ -547,10 +565,12 @@ code {
   cursor: grabbing;
 }
 
+/* The tile is already the media's shape, so `contain` has nothing to trim:
+   it only guards the last pixel of rounding, and never crops a render. */
 .stage-frame img {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
   pointer-events: none;
 }
 
@@ -559,8 +579,10 @@ code {
   outline-offset: 2px;
 }
 
-/* A render in flight owns its slot: a blueprint square that fills from the
-   bottom while it works, so the space is claimed and the wait is visible. */
+/* A render in flight owns its slot: a blueprint tile that fills from the
+   bottom while it works, so the space is claimed and the wait is visible.
+   The tile wears the shape the render is heading for, and the canvas sets its
+   padding from that shape, so a wide or a tall slot keeps its label inside. */
 .stage-frame.is-pending {
   display: flex;
   flex-direction: column;
@@ -613,6 +635,54 @@ code {
   animation: none;
   height: var(--pending-progress);
   transition: height 1.2s ease-out;
+}
+
+/* Stops the render on the server; sized in canvas units, so it scales with the tile. */
+.pending-cancel {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 1px solid rgba(242, 255, 89, 0.35);
+  border-radius: 50%;
+  background: rgba(27, 20, 33, 0.8);
+  color: var(--lime);
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.pending-cancel:hover {
+  background: var(--lime);
+  color: var(--plum);
+}
+
+/* The Assets tab's tiles are a few dozen pixels wide, not 512, and their ✕
+   only shows on hover (or keyboard focus, so it can still be reached). */
+.pending-cancel.is-small {
+  top: 6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  font-size: 10px;
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+
+.asset-pending:hover .pending-cancel.is-small,
+.pending-cancel.is-small:focus-visible {
+  opacity: 1;
+}
+
+/* A clicked rendering tile on the canvas: solid edge, so it reads as selected. */
+.stage-frame.is-pending.is-armed {
+  border-style: solid;
+  border-color: var(--lime);
 }
 
 .pending-clock {
@@ -1914,6 +1984,20 @@ code {
   outline: none;
 }
 
+/* H3 Local's Video Reference: Auto or Write it, above the box it replaces. */
+.cast-switch {
+  flex: none;
+  margin: 8px 8px 0;
+}
+
+.cast-hint {
+  margin: 0;
+  padding: 16px 14px 10px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
 .prompt-footer {
   display: flex;
   flex-wrap: wrap;
@@ -2010,6 +2094,26 @@ code {
   color: var(--lime);
   font-size: 8px;
   letter-spacing: 0;
+}
+
+/* A slot whose image tags the prompt: the ✕ is its own button in the corner. */
+.reference-slot {
+  position: relative;
+  display: inline-flex;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.reference-slot .reference-x {
+  z-index: 1;
+  padding: 0;
+  border: 0;
+  cursor: pointer;
+}
+
+.reference-slot .reference-x:hover:not(:disabled) {
+  background: var(--lime);
+  color: var(--plum);
 }
 
 .references.is-muted {
@@ -2696,7 +2800,8 @@ code {
 }
 
 .model-panel {
-  max-width: 520px;
+  /* Wide enough for the longest one-line note (FLUX.3's), 12px at this face. */
+  max-width: 560px;
 }
 
 .model-intro {
@@ -2828,6 +2933,66 @@ code {
   font-size: 9px;
 }
 
+/* The Openjutsu gear's API key switch: the form's label over a compact,
+   tier-style pill toggle (the H3 card's Original/Max/Turbo). */
+.model-config .api-toggle {
+  display: grid;
+  gap: 6px;
+}
+
+.model-config .api-toggle-label {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.model-config .api-toggle-buttons {
+  display: inline-flex;
+  width: fit-content;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.model-config .api-toggle-buttons button {
+  padding: 4px 11px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: none;
+  color: var(--faint);
+  font-family: inherit;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.model-config .api-toggle-buttons button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--ink);
+}
+
+/* Quiet, not the lime the model tiers use: the API choice is a setting, not
+   the card's headline call to action. */
+.model-config .api-toggle-buttons button.is-active {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--ink);
+}
+
+.model-config .api-toggle-buttons button.is-active:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--ink);
+}
+
+.model-config .api-toggle-buttons button:focus-visible {
+  outline: 1px solid rgba(240, 239, 237, 0.35);
+  outline-offset: 1px;
+}
+
 .model-config .account-form input,
 .model-config .account-form select {
   height: 38px;
@@ -2887,6 +3052,83 @@ code {
 
 .field-mark.bad {
   color: var(--danger);
+}
+
+/* A key field shown as dots without being a password field (see the gear's OpenRouter key). */
+.secret-input {
+  -webkit-text-security: disc;
+}
+
+.extras-toggle {
+  justify-self: end;
+  justify-content: flex-end;
+  text-align: right;
+  margin: -2px 0 0;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+/* The Extras' Upscale switch: the panel's Edit switch, laid out as a form row. */
+.edit-switch.extras-switch {
+  justify-self: start;
+  margin-left: 0;
+}
+
+.extras-switch .edit-label {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.extras-switch.is-on .edit-label {
+  color: var(--ink);
+}
+
+.extras-toggle:hover,
+.extras-toggle[aria-expanded="true"] {
+  color: var(--ink);
+}
+
+.verify-files {
+  display: grid;
+  gap: 6px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.verify-files li {
+  display: grid;
+  grid-template-columns: 14px auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+}
+
+.verify-files li.ok > span:first-child {
+  color: var(--lime);
+}
+
+.verify-files li.bad > span:first-child,
+.verify-files li.bad code {
+  color: var(--danger);
+}
+
+.verify-files code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
 }
 
 .verify-banner {
@@ -3016,27 +3258,27 @@ code {
 }
 
 .model-note {
+  min-width: 0;
   color: var(--faint);
   font-size: 12px;
   line-height: 1.45;
+  /* One line per description: a long note truncates instead of growing the card. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* The H3 card is a group, not a radio: the three Router entries are picked
-   with the segmented toggle inside the card, so the card itself is not a
-   button and must not inherit its centring. */
+/* The H3 card picks like any other entry (its last tier, Original by default),
+   but it holds the tier toggle, so it is a div rather than a button and keeps
+   its content top-aligned. */
 .model-option.is-family {
   align-items: flex-start;
-  cursor: default;
+  cursor: pointer;
 }
 
-.model-option.is-family:hover {
-  border-color: var(--line-soft);
-  background: rgba(255, 255, 255, 0.02);
-}
-
-.model-option.is-family.is-active:hover {
-  border-color: rgba(242, 255, 89, 0.5);
-  background: rgba(242, 255, 89, 0.07);
+.model-option.is-family:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 2px;
 }
 
 .model-option.is-family > svg {
@@ -3338,6 +3580,12 @@ button.panel-row:hover:not(:disabled) {
   margin: 0 0 10px;
 }
 
+/* With no mode row between them (a one-mode model like Openjutsu), the clip
+   row would sit flush against the model row. */
+.panel-row + .media-row {
+  margin-top: 10px;
+}
+
 .media-row .media-drop {
   flex: 1;
   min-width: 0;
@@ -3380,6 +3628,7 @@ button.panel-row:hover:not(:disabled) {
 }
 
 .trim-preview {
+  position: relative;
   overflow: hidden;
   margin-bottom: 12px;
   border: 1px solid var(--line-soft);
@@ -3393,6 +3642,51 @@ button.panel-row:hover:not(:disabled) {
   max-height: 260px;
   object-fit: contain;
   background: #0f0b13;
+}
+
+/* The mini player: plays the chosen window on a loop, with its sound. */
+.trim-play {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: rgba(27, 20, 33, 0.82);
+  color: var(--lime);
+  backdrop-filter: blur(6px);
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+
+.trim-play:hover {
+  background: var(--lime);
+  color: var(--plum);
+  transform: scale(1.06);
+}
+
+.trim-play svg {
+  /* The triangle's weight sits left of its box; nudge it to look centred. */
+  margin-left: 2px;
+}
+
+.trim-play.is-playing svg {
+  margin-left: 0;
+}
+
+.trim-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--ink);
+  box-shadow: 0 0 6px rgba(240, 239, 237, 0.6);
+  pointer-events: none;
 }
 
 .trim-audio {
@@ -3532,7 +3826,7 @@ button.panel-row:hover:not(:disabled) {
 .stage-frame video {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
   pointer-events: none;
 }
 
@@ -3963,6 +4257,11 @@ button.panel-row:hover:not(:disabled) {
   font-size: 11.5px;
 }
 
+/* Where the grid mounts its next page once scrolled into reach. */
+.asset-more {
+  height: 1px;
+}
+
 /* A render in flight, drawn like the blueprint square on the canvas so the
    library and the canvas agree that this slot is taken and working. */
 .asset-pending {
@@ -4371,4 +4670,22 @@ button.panel-row:hover:not(:disabled) {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* The reviewer shortcut's one-line status page (app/openjutsu-prime). */
+.shortcut {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: 24px;
+  text-align: center;
+}
+
+.shortcut p {
+  max-width: 620px;
+  margin: 0;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
 }

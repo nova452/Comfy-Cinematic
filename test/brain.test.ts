@@ -25,6 +25,9 @@ import {
 test("default brain is an anthropic model", () => {
   assert.equal(providerOf(DEFAULT_BRAIN), "anthropic");
   assert.ok(SYSTEM_PROMPT.includes("\"intent\""));
+  // Its app knowledge names the local casting entry and its default pass.
+  assert.ok(SYSTEM_PROMPT.includes("Openjutsu Prime"));
+  assert.ok(SYSTEM_PROMPT.includes("Light"));
 });
 
 test("the Create prompt can only be rewritten, never answered", () => {

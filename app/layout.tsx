@@ -1,17 +1,29 @@
 import type { Metadata } from "next";
-import { Anton, Space_Grotesk } from "next/font/google";
+import localFont from "next/font/local";
 import "./globals.css";
 
-const display = Anton({
-  subsets: ["latin"],
+/**
+ * Both faces are self-hosted, not fetched by `next/font/google`.
+ *
+ * Google answers a `css2` request with an extensionless
+ * `fonts.gstatic.com/l/font?kit=…&skey=…&v=…` URL about one time in sixty.
+ * Turbopack parses the font's own options as a query string, the `&` splits it,
+ * and the build dies with "next/font/google queries have exactly one entry"
+ * (vercel/next.js#99114, fixed only in 16.5 canaries). Keeping the files beside
+ * this one makes a build depend on this repository and nothing else — and the
+ * bytes are Google's own latin subsets, so the CSS variables do not change.
+ */
+const display = localFont({
+  src: "./fonts/anton-latin.woff2",
   weight: "400",
   variable: "--font-display",
   display: "swap",
 });
 
-const ui = Space_Grotesk({
-  subsets: ["latin"],
-  weight: ["400", "500", "600", "700"],
+const ui = localFont({
+  // A variable file: one file covers every weight the panel asks for.
+  src: "./fonts/space-grotesk-latin.woff2",
+  weight: "300 700",
   variable: "--font-ui",
   display: "swap",
 });
@@ -19,7 +31,7 @@ const ui = Space_Grotesk({
 export const metadata: Metadata = {
   title: "Comfy Cinematic",
   description:
-    "A project canvas for Comfy Router. Describe a frame and it lands on the canvas; ask a question and the harness answers. FLUX 3 stills up to 4K and MiniMax H3 clips.",
+    "Project canvases for FLUX 3 stills and MiniMax H3 clips on Comfy Router.",
   openGraph: {
     title: "Comfy Cinematic",
     description: "Project canvases with FLUX 3 stills and MiniMax H3 clips, built on Comfy Router.",

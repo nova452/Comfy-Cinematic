@@ -16,6 +16,8 @@ const MAX_HEADER = 8 * 1024;
 export type StudioSettings = {
   account?: Record<string, unknown>;
   localModel?: Record<string, unknown>;
+  /** Openjutsu's own file names / steps / key, split from `localModel`. */
+  openjutsu?: Record<string, unknown>;
   localImage?: Record<string, unknown>;
 };
 
@@ -41,6 +43,7 @@ export function decodeSettings(value: string | null | undefined): StudioSettings
     return {
       ...(isRecord(parsed.account) ? { account: parsed.account } : {}),
       ...(isRecord(parsed.localModel) ? { localModel: parsed.localModel } : {}),
+      ...(isRecord(parsed.openjutsu) ? { openjutsu: parsed.openjutsu } : {}),
       ...(isRecord(parsed.localImage) ? { localImage: parsed.localImage } : {}),
     };
   } catch {

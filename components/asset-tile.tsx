@@ -1,7 +1,9 @@
 "use client";
 
+import { memo } from "react";
 import type { Asset, AssetKind } from "../lib/assets";
-import { mediaUrl } from "../lib/browser-media";
+import { PLACEHOLDER, useMediaUrl } from "../lib/browser-media";
+import { useNearViewport } from "./near-viewport";
 
 export function CloudIcon() {
   return (
@@ -70,18 +72,27 @@ type Props = {
  *
  * The picker opens a tile into a slot; the Assets tab opens it full size. Both
  * take `onOpen`, so a tile always does something when it is clicked.
+ *
+ * A tile reads nothing until it scrolls near the screen: its blob stays in
+ * IndexedDB and a clip mounts no `<video>`, so a long library costs what is
+ * visible rather than everything in it.
  */
-export function AssetTile({ asset, liked, disabled, onOpen, onToggleLike }: Props) {
+export const AssetTile = memo(function AssetTile({ asset, liked, disabled, onOpen, onToggleLike }: Props) {
   const title = asset.note ?? asset.name;
+  const [ref, near] = useNearViewport<HTMLDivElement>();
+  const visual = asset.kind !== "audio";
+  const url = useMediaUrl(asset.src, near && visual);
+  // Nothing is mounted over the placeholder: a `<video>` on a 1×1 GIF errors.
+  const ready = url !== PLACEHOLDER;
 
   return (
-    <div className="asset-tile">
+    <div className="asset-tile" ref={ref}>
       <button type="button" className="asset-open" title={title} onClick={onOpen} disabled={disabled}>
         <span className={`asset-preview is-${asset.kind}`} aria-hidden="true">
           {asset.kind === "image" ? (
-            <img src={mediaUrl(asset.src)} alt="" loading="lazy" draggable={false} />
+            ready && <img src={url} alt="" decoding="async" draggable={false} />
           ) : asset.kind === "video" ? (
-            <video src={mediaUrl(asset.src)} muted playsInline preload="metadata" />
+            ready && <video src={url} muted playsInline preload="metadata" />
           ) : (
             <span className="asset-audio-glyph">
               <KindIcon kind="audio" />
@@ -112,11 +123,13 @@ export function AssetTile({ asset, liked, disabled, onOpen, onToggleLike }: Prop
       )}
     </div>
   );
-}
+});
 
 type PendingProps = {
   kind: AssetKind;
   prompt: string;
+  /** Stops the render; its ✕ shows while the tile is hovered or focused. */
+  onCancel?: () => void;
 };
 
 /**
@@ -124,7 +137,7 @@ type PendingProps = {
  * blueprint square that fills from the bottom while the work runs. The library
  * should not look empty just because the newest asset is still cooking.
  */
-export function PendingTile({ kind, prompt }: PendingProps) {
+export function PendingTile({ kind, prompt, onCancel }: PendingProps) {
   return (
     <div className="asset-tile">
       <div className="asset-pending" data-kind={kind} title={prompt}>
@@ -132,6 +145,17 @@ export function PendingTile({ kind, prompt }: PendingProps) {
           <KindIcon kind={kind} />
         </span>
         <span className="asset-pending-label">Rendering</span>
+        {onCancel && (
+          <button
+            type="button"
+            className="pending-cancel is-small"
+            title={kind === "video" ? "Cancel this clip" : "Cancel this render"}
+            aria-label={kind === "video" ? "Cancel this clip" : "Cancel this render"}
+            onClick={onCancel}
+          >
+            ✕
+          </button>
+        )}
       </div>
       <span className="asset-label">{prompt}</span>
     </div>

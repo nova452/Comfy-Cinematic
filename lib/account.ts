@@ -237,6 +237,11 @@ export function envRouterKey(env: NodeJS.ProcessEnv = process.env) {
   return isPublicHosting(env) ? undefined : env.COMFY_API_KEY?.trim() || undefined;
 }
 
+/** The server's own OpenRouter key for the ref5 graph, under the same rule. */
+export function envOpenRouterKey(env: NodeJS.ProcessEnv = process.env) {
+  return isPublicHosting(env) ? undefined : env.OPENROUTER_API_KEY?.trim() || undefined;
+}
+
 /** The server's own ComfyUI token, under the same rule. */
 export function envLocalKey(env: NodeJS.ProcessEnv = process.env) {
   return isPublicHosting(env) ? undefined : env.COMFY_LOCAL_API_KEY?.trim() || undefined;

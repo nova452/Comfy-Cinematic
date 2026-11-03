@@ -7,7 +7,7 @@
  */
 
 import { assetKindFrom, MAX_UPLOADS } from "./assets.ts";
-import { isReferenceCaption } from "./video.ts";
+import { findVideoModel, isReferenceCaption, supportsContinuation, videoModeLabel } from "./video.ts";
 
 export const FRAME_SIZE = 512;
 export const FRAME_GAP = 32;
@@ -44,6 +44,23 @@ export const ASSET_SRC =
 /** True when a stored source is a clip rather than a still. */
 export function isVideoSrc(src: string) {
   return /\.(mp4|webm)$/i.test(src);
+}
+
+/**
+ * What a frame is called when it is shown.
+ *
+ * The typed words are the frame's name. A reference-mode clip can be made
+ * without any: what the model saw is a six-section brief, not a caption, and
+ * the caption the panel used to store in its place (`"Video Reference
+ * reference"`) was neither. Such a clip goes by its mode, and the brief stays
+ * in the viewer's "Prompt sent" fold.
+ */
+export function frameTitle(frame: Pick<Frame, "src" | "prompt" | "sourcePrompt" | "recipe">) {
+  const typed = frame.sourcePrompt?.trim() ?? "";
+  if (typed) return typed;
+  const mode = frame.recipe?.video?.mode;
+  if (mode && mode !== "free") return videoModeLabel(mode);
+  return frame.prompt?.trim() || (isVideoSrc(frame.src) ? "Clip" : "Still");
 }
 
 const PROJECT_ID = /^[a-f0-9-]{8,64}$/i;
@@ -87,6 +104,9 @@ export type FrameTab = (typeof FRAME_TABS)[number];
 /** The video route's modes, mirrored so a stored recipe is never trusted. */
 export const FRAME_MODES = ["free", "audio", "video"] as const;
 
+/** A library entry a recipe may name: an upload, a render, or a bundled sample. */
+const CLIP_ASSET_ID = /^(?:upload|render):[a-f0-9-]{8,64}$|^sample:\d{1,3}$/i;
+
 /**
  * What a frame was made from.
  *
@@ -119,8 +139,37 @@ export type FrameRecipe = {
     resolution: string;
     /** Whole seconds, as the route validates it. */
     duration: number;
+    /** The library entry the reference clip came from, so Reuse can attach it again. */
+    clip?: string;
+    /** Seconds into that clip where the trim window starts. */
+    start?: number;
   };
 };
+
+/**
+ * The model a clip was rendered with, when the project still knows one.
+ *
+ * A recipe is the current record; frames made before recipes existed kept
+ * their model on the frame itself.
+ */
+export function frameVideoModel(frame: Pick<Frame, "model" | "recipe">) {
+  return findVideoModel(frame.recipe?.video?.model ?? frame.model);
+}
+
+/**
+ * Whether a clip can be continued.
+ *
+ * Continue extends a clip on the plain H3 stack, so only a clip one of those
+ * entries rendered can take one — Openjutsu's ref5 graph casts characters into
+ * a clip rather than extending one. A still has nothing to continue, and a
+ * clip that recorded no model at all is not ruled out: the panel lands on H3
+ * Local for it.
+ */
+export function canContinueFrame(frame: Pick<Frame, "src" | "model" | "recipe">) {
+  if (!isVideoSrc(frame.src)) return false;
+  const model = frameVideoModel(frame);
+  return !model || supportsContinuation(model);
+}
 
 export type Message = {
   id: string;
@@ -242,12 +291,18 @@ function normalizeRecipe(raw: unknown): FrameRecipe | undefined {
     const clip = video as Record<string, unknown>;
     const model = shortText(clip.model, 64);
     if (model) {
+      const clipId = shortText(clip.clip, 80);
+      // The trim window is a position inside the reference, never negative and
+      // never beyond the longest clip a model takes.
+      const start = Math.max(0, Math.min(60, Math.round(toNumber(clip.start, 0) * 1000) / 1000));
       recipe.video = {
         model,
         mode: FRAME_MODES.find((candidate) => candidate === clip.mode) ?? "free",
         ratio: shortText(clip.ratio, 16) ?? "",
         resolution: shortText(clip.resolution, 16) ?? "",
         duration: Math.max(1, Math.min(60, Math.round(toNumber(clip.duration, 1)))),
+        ...(clipId && CLIP_ASSET_ID.test(clipId) ? { clip: clipId } : {}),
+        ...(start > 0 ? { start } : {}),
       };
     }
   }
@@ -282,13 +337,14 @@ function normalizeFrame(raw: unknown): Frame | undefined {
 
   const sourcePrompt =
     typeof value.sourcePrompt === "string" ? value.sourcePrompt.slice(0, 900) : undefined;
+  const sentPrompt = typeof value.prompt === "string" ? value.prompt.slice(0, MAX_FRAME_PROMPT) : "";
 
   return {
     id: typeof value.id === "string" && value.id ? value.id.slice(0, 64) : crypto.randomUUID(),
     src,
-    prompt:
-      typeof value.prompt === "string" ? value.prompt.slice(0, MAX_FRAME_PROMPT) : "",
-    // A caption saved in place of an empty prompt is not a prompt.
+    // A caption saved in place of an empty prompt is not a prompt: older
+    // reference clips were named `"Video Reference reference"` that way.
+    prompt: isReferenceCaption(sentPrompt) ? "" : sentPrompt,
     sourcePrompt: sourcePrompt && isReferenceCaption(sourcePrompt) ? "" : sourcePrompt,
     enhanced: value.enhanced === true ? true : undefined,
     recipe: normalizeRecipe(value.recipe),
@@ -453,6 +509,76 @@ export function frameBounds(frames: Frame[], size = FRAME_SIZE) {
   const right = Math.max(...frames.map((frame) => frame.x + size));
   const bottom = Math.max(...frames.map((frame) => frame.y + size));
   return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+/** How much room a tile takes on the board: the media's shape, not a square. */
+export type FrameBox = { width: number; height: number };
+
+/**
+ * A stored ratio id as a number: `"16:9"` is 1.777…, anything else is nothing.
+ *
+ * A project read back from the browser is untrusted input, so a malformed
+ * ratio falls through to the square rather than producing a nonsense tile.
+ */
+export function ratioValue(id: unknown) {
+  if (typeof id !== "string") return undefined;
+  const match = /^(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)$/.exec(id.trim());
+  if (!match) return undefined;
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  return width > 0 && height > 0 ? width / height : undefined;
+}
+
+/**
+ * The shape a frame's preview is drawn at.
+ *
+ * The media's own dimensions win once they are known: a local render does not
+ * always come back in the shape the panel asked for, and the file is the
+ * truth. Until the blob loads, the recipe's ratio holds the tile at the shape
+ * the person asked for, and a frame that recorded neither is a square.
+ */
+export function frameAspect(frame: Pick<Frame, "recipe">, measured?: number) {
+  if (measured !== undefined && Number.isFinite(measured) && measured > 0) return measured;
+  return ratioValue(frame.recipe?.video?.ratio ?? frame.recipe?.ratio) ?? 1;
+}
+
+/**
+ * The tile a frame's preview fills.
+ *
+ * The media keeps its own shape inside one square slot: a 16:9 clip is
+ * 512×288, a 9:16 clip is 288×512, and a square still fills the slot. Nothing
+ * is cropped, and no tile takes more room than the grid reserved for it.
+ */
+export function frameBox(frame: Pick<Frame, "recipe">, measured?: number, size = FRAME_SIZE): FrameBox {
+  return fitFrameBox(frameAspect(frame, measured), size);
+}
+
+/**
+ * The tile a shape fills inside one square slot.
+ *
+ * A shape nobody knows yet — a render in flight whose route has not answered,
+ * or a ratio like `"auto"` — keeps the slot itself, so an unknown tile is the
+ * square the grid expects rather than a guess.
+ */
+export function fitFrameBox(aspect: number | undefined, size = FRAME_SIZE): FrameBox {
+  if (aspect === undefined || !Number.isFinite(aspect) || aspect <= 0) {
+    return { width: size, height: size };
+  }
+  return aspect >= 1
+    ? { width: size, height: Math.max(1, Math.round(size / aspect)) }
+    : { width: Math.max(1, Math.round(size * aspect)), height: size };
+}
+
+/** Where a tile sits inside its slot, so a wide or a tall frame is centred. */
+export function frameOffset(box: FrameBox, size = FRAME_SIZE) {
+  return { x: (size - box.width) / 2, y: (size - box.height) / 2 };
+}
+
+/** A tile's rect on the board: its slot's corner plus the centring offset. */
+export function frameRect(frame: Pick<Frame, "x" | "y" | "recipe">, measured?: number, size = FRAME_SIZE) {
+  const box = frameBox(frame, measured, size);
+  const offset = frameOffset(box, size);
+  return { x: frame.x + offset.x, y: frame.y + offset.y, width: box.width, height: box.height };
 }
 
 export function relativeTime(timestamp: number, now = Date.now()) {

@@ -4,17 +4,26 @@ import {
   FRAME_SIZE,
   MAX_FRAME_PROMPT,
   MAX_FRAMES,
+  canContinueFrame,
   clipSeconds,
   createProject,
+  fitFrameBox,
+  frameAspect,
   frameBounds,
+  frameBox,
+  frameOffset,
+  frameRect,
+  frameTitle,
   isVideoSrc,
   nextPosition,
   normalizeName,
   normalizeProject,
+  ratioValue,
   relativeTime,
   stylePhrase,
   summarize,
   type Frame,
+  type FrameRecipe,
 } from "../lib/projects.ts";
 
 const SRC = "/api/renders/11111111-2222-3333-4444-555555555555.png";
@@ -84,6 +93,66 @@ test("bounds cover every frame", () => {
   assert.deepEqual(frameBounds([]), { x: 0, y: 0, width: FRAME_SIZE, height: FRAME_SIZE });
 });
 
+test("ratio ids are read, and nonsense is not", () => {
+  assert.equal(ratioValue("16:9"), 16 / 9);
+  assert.equal(ratioValue("1:1"), 1);
+  assert.equal(ratioValue(" 4 : 3 "), 4 / 3);
+  assert.equal(ratioValue("adaptive"), undefined);
+  assert.equal(ratioValue("0:9"), undefined);
+  assert.equal(ratioValue(undefined), undefined);
+});
+
+test("a tile takes the media's shape inside its square slot", () => {
+  const wide = frame({ recipe: { tab: "create", ratio: "16:9" } });
+  assert.deepEqual(frameBox(wide), { width: FRAME_SIZE, height: 288 });
+  assert.deepEqual(frameBox(wide, undefined, 400), { width: 400, height: 225 });
+
+  const clip = frame({
+    recipe: {
+      tab: "video",
+      video: { model: "minimax/h3", mode: "free", ratio: "9:16", resolution: "768p", duration: 5 },
+    },
+  });
+  assert.deepEqual(frameBox(clip), { width: 288, height: FRAME_SIZE });
+
+  // A frame that recorded no shape at all stays the square the grid expects.
+  assert.deepEqual(frameBox(frame()), { width: FRAME_SIZE, height: FRAME_SIZE });
+});
+
+test("a measured shape beats the shape that was asked for", () => {
+  const asked = frame({ recipe: { tab: "create", ratio: "16:9" } });
+  assert.equal(frameAspect(asked), 16 / 9);
+
+  // A render that came back square is shown square, not cropped to the ask.
+  assert.deepEqual(frameBox(asked, 1), { width: FRAME_SIZE, height: FRAME_SIZE });
+
+  // A measurement that cannot be a size falls back to the recipe.
+  assert.equal(frameAspect(asked, 0), 16 / 9);
+});
+
+test("a render in flight can wear a shape, or keep the slot", () => {
+  assert.deepEqual(fitFrameBox(16 / 9), { width: FRAME_SIZE, height: 288 });
+  assert.deepEqual(fitFrameBox(9 / 16, 400), { width: 225, height: 400 });
+
+  // A route that decides its own shape (Auto, an edited canvas) has none to
+  // wear until it answers, so the slot stays the square the grid reserved.
+  assert.deepEqual(fitFrameBox(undefined), { width: FRAME_SIZE, height: FRAME_SIZE });
+  assert.deepEqual(fitFrameBox(Number.NaN), { width: FRAME_SIZE, height: FRAME_SIZE });
+  assert.deepEqual(fitFrameBox(0), { width: FRAME_SIZE, height: FRAME_SIZE });
+});
+
+test("a tile is centred in its slot, and its rect follows", () => {
+  const wide = frame({ x: 100, y: 200, recipe: { tab: "create", ratio: "16:9" } });
+  const box = frameBox(wide);
+  assert.deepEqual(frameOffset(box), { x: 0, y: (FRAME_SIZE - 288) / 2 });
+  assert.deepEqual(frameRect(wide), {
+    x: 100,
+    y: 200 + (FRAME_SIZE - 288) / 2,
+    width: FRAME_SIZE,
+    height: 288,
+  });
+});
+
 test("only local render paths are accepted as frame sources", () => {
   const ok = normalizeProject({ id: crypto.randomUUID(), frames: [frame()] });
   assert.equal(ok?.frames.length, 1);
@@ -120,6 +189,76 @@ test("keeps the typed prompt and reference images on a frame", () => {
   assert.equal(saved?.enhanced, true);
   assert.deepEqual(saved?.characterSrcs, [SRC, SRC]);
   assert.equal(saved?.backgroundSrc, SRC);
+});
+
+test("a caption stored as a prompt is not a prompt", () => {
+  const project = normalizeProject({
+    id: crypto.randomUUID(),
+    frames: [
+      frame({ prompt: "Video Reference reference", sourcePrompt: "Video Reference reference" }),
+      frame({ prompt: "Video Reference reference", sourcePrompt: "" }),
+      frame({ prompt: "subject_definitions: a rooftop at dusk…" }),
+    ],
+  });
+
+  // What the panel called the clip is dropped from both fields.
+  assert.equal(project?.frames[0]?.prompt, "");
+  assert.equal(project?.frames[0]?.sourcePrompt, "");
+  assert.equal(project?.frames[1]?.prompt, "");
+  assert.equal(project?.frames[1]?.sourcePrompt, "");
+  // A brief the model actually wrote is a prompt and survives.
+  assert.equal(project?.frames[2]?.prompt, "subject_definitions: a rooftop at dusk…");
+});
+
+test("a promptless clip is named after its mode", () => {
+  const clip = (overrides: Partial<Frame> = {}) =>
+    frame({ ...overrides, src: "/api/renders/11111111-2222-3333-4444-555555555555.mp4" });
+  const recipe = (mode: string): FrameRecipe => ({
+    tab: "video",
+    video: { model: "minimax/h3", mode, ratio: "16:9", resolution: "1k", duration: 5 },
+  });
+
+  // No typed words and no rewrite: the mode names the clip, not a caption.
+  assert.equal(frameTitle(clip({ prompt: "", recipe: recipe("video") })), "Video Reference");
+  assert.equal(frameTitle(clip({ prompt: "", recipe: recipe("audio") })), "Audio Reference");
+  // The person's own words always win, and the brief stays the sent text.
+  assert.equal(
+    frameTitle(clip({ prompt: "a brief", sourcePrompt: "make it night", recipe: recipe("video") })),
+    "make it night",
+  );
+  // A free clip has no mode to be named after, so its sent prompt is its name.
+  assert.equal(frameTitle(clip({ prompt: "a shot", recipe: recipe("free") })), "a shot");
+  assert.equal(frameTitle(clip({ prompt: "" })), "Clip");
+  assert.equal(frameTitle(frame({ prompt: "" })), "Still");
+});
+
+test("only a clip an H3 entry made is offered Continue", () => {
+  const clip = (model: string, recipeModel?: string) =>
+    frame({
+      src: "/api/renders/11111111-2222-3333-4444-555555555555.mp4",
+      media: "video",
+      model,
+      ...(recipeModel
+        ? {
+            recipe: {
+              tab: "video" as const,
+              video: { model: recipeModel, mode: "video", ratio: "16:9", resolution: "480P", duration: 5 },
+            },
+          }
+        : {}),
+    });
+
+  // Continue extends a clip on the plain H3 stack, on Router or locally.
+  assert.equal(canContinueFrame(clip("local/minimax-h3")), true);
+  assert.equal(canContinueFrame(clip("minimax/minimax-h3")), true);
+  // Openjutsu casts characters into a clip; it cannot extend one.
+  assert.equal(canContinueFrame(clip("local/openjutsu")), false);
+  // The recipe is the record, so it wins over a legacy frame model.
+  assert.equal(canContinueFrame(clip("local/openjutsu", "local/minimax-h3")), true);
+  // A clip that recorded no model at all is not ruled out.
+  assert.equal(canContinueFrame(clip("")), true);
+  // A still has nothing to continue either way.
+  assert.equal(canContinueFrame(frame({ model: "bfl/flux-3-image" })), false);
 });
 
 test("keeps a single reference image on a still", () => {
@@ -196,6 +335,67 @@ test("keeps the recipe a frame was made with", () => {
     resolution: "768P",
     duration: 8,
   });
+});
+
+test("keeps the reference clip and trim window a recipe names", () => {
+  const clip = `upload:${crypto.randomUUID()}`;
+  const project = normalizeProject({
+    id: crypto.randomUUID(),
+    frames: [
+      frame({
+        media: "video",
+        recipe: {
+          tab: "video",
+          video: {
+            model: "minimax/minimax-h3",
+            mode: "video",
+            ratio: "16:9",
+            resolution: "768P",
+            duration: 5,
+            clip,
+            start: 1.25,
+          },
+        },
+      }),
+    ],
+  });
+
+  assert.deepEqual(project?.frames[0]?.recipe?.video, {
+    model: "minimax/minimax-h3",
+    mode: "video",
+    ratio: "16:9",
+    resolution: "768P",
+    duration: 5,
+    clip,
+    start: 1.25,
+  });
+});
+
+test("a recipe drops a clip id it could not resolve and a bad trim start", () => {
+  const project = normalizeProject({
+    id: crypto.randomUUID(),
+    frames: [
+      frame({
+        media: "video",
+        recipe: {
+          tab: "video",
+          video: {
+            model: "minimax/minimax-h3",
+            mode: "video",
+            ratio: "16:9",
+            resolution: "768P",
+            duration: 5,
+            clip: "javascript:alert(1)",
+            start: -4,
+          },
+        },
+      }),
+    ],
+  });
+
+  const video = project?.frames[0]?.recipe?.video;
+  assert.equal(video?.clip, undefined);
+  assert.equal(video?.start, undefined);
 });
 
 test("keeps an image recipe's shape, size and batch", () => {

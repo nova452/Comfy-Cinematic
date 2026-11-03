@@ -3,14 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { apiFetch, forgetAccount, readSettings, rememberAccount, type StoredAccount } from "../lib/client-settings";
-import {
-  REFERENCE_PROMPT_SPEC,
-  acceptsVideo,
-  formatPromptSpec,
-  parsePromptSpec,
-  referencePrompt,
-  type ThinkingLevel,
-} from "../lib/brain";
+import type { ThinkingLevel } from "../lib/brain";
 
 /**
  * Credits + account management for the top-right corner.
@@ -126,7 +119,6 @@ export function AccountMenu() {
   const [deploymentDraft, setDeploymentDraft] = useState("");
   const [desktopDraft, setDesktopDraft] = useState("");
   const [targetDraft, setTargetDraft] = useState<RenderTarget>("desktop");
-  const [specDraft, setSpecDraft] = useState<string>(REFERENCE_PROMPT_SPEC);
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string>();
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -177,7 +169,6 @@ export function AccountMenu() {
     setDeploymentDraft(account?.deployment ?? "");
     setDesktopDraft(account?.desktop ?? "");
     setTargetDraft(account?.target ?? (account?.deployment ? "deployment" : "desktop"));
-    setSpecDraft(formatPromptSpec(referencePrompt(account)));
     setMenuOpen(false);
     setDialogOpen(true);
   }
@@ -187,20 +178,6 @@ export function AccountMenu() {
     const key = keyDraft.trim();
     if (!account?.signedIn && !key) {
       setFormError("Paste a key first.");
-      return;
-    }
-
-    // One pasted spec, read here so the dialog can point at the field instead
-    // of failing the whole save on a typo the route would reject anyway.
-    const prompt = parsePromptSpec(specDraft);
-    if (!prompt) {
-      setFormError("Paste a model and a thinking level, like anthropic/claude-opus-5-5/medium.");
-      return;
-    }
-    // Only Google's models read video and audio, and this setting exists to
-    // configure exactly the rewrite that needs to watch the clip.
-    if (!acceptsVideo(prompt.brain)) {
-      setFormError("Reference rewrites need a model that can watch the clip. Try vertexai/gemini-3.8-flash/medium.");
       return;
     }
 
@@ -215,8 +192,6 @@ export function AccountMenu() {
           deployment: deploymentDraft,
           desktop: desktopDraft,
           target: targetDraft,
-          brain: prompt.brain,
-          thinking: prompt.thinking,
         }),
       });
       const data = (await response.json().catch(() => ({}))) as Account & { error?: string };
@@ -351,8 +326,7 @@ export function AccountMenu() {
                   this is the only place the key is explained. */}
               {!signedIn && (
                 <p className="account-lede">
-                  Paste a Router key. It is checked against Comfy, then kept in this browser and sent
-                  only with your own renders.
+                  Paste a Router key. It stays in this browser and only signs your own renders.
                 </p>
               )}
 
@@ -464,7 +438,7 @@ export function AccountMenu() {
                     />
                     <label htmlFor="target-desktop" className="account-target-info">
                       <b>Comfy Desktop</b>
-                      <span>Your ComfyUI, direct or behind comfy-api-proxy</span>
+                      <span>Your ComfyUI, direct or proxied</span>
                     </label>
                     <input
                       className="account-target-url"
@@ -480,29 +454,6 @@ export function AccountMenu() {
                     />
                   </div>
                 </fieldset>
-
-                {/* The prompt model steers reference rewrites, which need a
-                    signed-in account anyway; first sign-in stays two fields. */}
-                {signedIn && (
-                  <fieldset className="account-targets">
-                    <legend>Prompt model</legend>
-
-                    <div className="account-prompt">
-                      <input
-                        id="prompt-spec"
-                        type="text"
-                        value={specDraft}
-                        autoComplete="off"
-                        spellCheck={false}
-                        placeholder={REFERENCE_PROMPT_SPEC}
-                        aria-label="Prompt model"
-                        aria-invalid={specDraft.trim() !== "" && !parsePromptSpec(specDraft)}
-                        disabled={busy}
-                        onChange={(event) => setSpecDraft(event.target.value)}
-                      />
-                    </div>
-                  </fieldset>
-                )}
 
                 {formError && (
                   <p className="account-error" role="alert">
@@ -521,7 +472,7 @@ export function AccountMenu() {
               </form>
 
               {account?.envKey && (
-                <p className="account-note">This host has its own COMFY_API_KEY. Your signed-in key is used first.</p>
+                <p className="account-note">This host sets COMFY_API_KEY; your key wins.</p>
               )}
 
               {!signedIn && (

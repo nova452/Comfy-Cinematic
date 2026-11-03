@@ -11,8 +11,11 @@ type Props = {
   minDuration: number;
   maxDuration: number;
   duration: number;
+  /** Where the window opens, in seconds; the last applied start (Openjutsu). */
+  start?: number;
   onClose: () => void;
-  onApply: (result: { duration: number; trimmed?: MediaFile }) => void;
+  /** `start` is where the chosen window begins, for a video. */
+  onApply: (result: { duration: number; start?: number; trimmed?: MediaFile }) => void;
 };
 
 function fromBase64(value: string) {
@@ -31,13 +34,26 @@ function toBase64(bytes: Uint8Array) {
 }
 
 const clock = (seconds: number) => `${Math.round(seconds)}s`;
+/** An edge of the window, which slides in fine steps: `12.4s`, or `12s` when whole. */
+const stamp = (seconds: number) => `${Number(seconds.toFixed(1))}s`;
 
-export function TrimModal({ kind, media, minDuration, maxDuration, duration, onClose, onApply }: Props) {
+/** Where the window sits snaps this finely; its length stays in whole seconds. */
+const POSITION_STEP = 0.1;
+
+export function TrimModal({ kind, media, minDuration, maxDuration, duration, start: givenStart, onClose, onApply }: Props) {
+  const initialStart = givenStart ?? 0;
   const [total, setTotal] = useState(0);
   const [start, setStart] = useState(0);
   const [end, setEnd] = useState(0);
   const [peaks, setPeaks] = useState<number[]>([]);
   const [error, setError] = useState<string>();
+  /** The mini player: the chosen window, looped with its sound. */
+  const [playing, setPlaying] = useState(false);
+  const [playhead, setPlayhead] = useState<number>();
+  const windowRef = useRef({ start: 0, end: 0 });
+  windowRef.current = { start, end };
+  /** Whether the pointer went down on the backdrop itself, not inside the panel. */
+  const backdropPress = useRef(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const waveRef = useRef<HTMLCanvasElement>(null);
@@ -58,7 +74,10 @@ export function TrimModal({ kind, media, minDuration, maxDuration, duration, onC
     // A reference shorter than the model's floor is used whole rather than
     // chopped to the last whole second.
     if (source <= minWindow) return { start: 0, end: source };
-    return { start: 0, end: Math.min(Math.max(1, Math.floor(source)), wanted) };
+    const length = Math.min(Math.max(1, Math.floor(source)), wanted);
+    // Reopen where the last window began, as far as the clip allows.
+    const from = Math.min(Math.max(0, initialStart), Math.max(0, source - length));
+    return { start: from, end: from + length };
   }
 
   /* --------------------------------- loading -------------------------------- */
@@ -157,9 +176,44 @@ export function TrimModal({ kind, media, minDuration, maxDuration, duration, onC
   function previewAt(seconds: number) {
     const element = videoRef.current;
     if (kind !== "video" || !element) return;
+    // Dragging takes over the frame; the player waits for the next press.
+    if (!element.paused) element.pause();
     if (Math.abs(element.currentTime - seconds) < 0.05) return;
     element.currentTime = Math.min(Math.max(0, seconds), Math.max(0, total - 0.05));
   }
+
+  /** Play the window from its start, with sound, or pause it. */
+  function togglePlay() {
+    const element = videoRef.current;
+    if (!element || total <= 0) return;
+    if (!element.paused) {
+      element.pause();
+      return;
+    }
+    if (element.currentTime < start || element.currentTime >= end - 0.05) element.currentTime = start;
+    element.muted = false;
+    element.play().catch(() => {
+      // No sound allowed here: play silently rather than not at all.
+      element.muted = true;
+      void element.play().catch(() => undefined);
+    });
+  }
+
+  // While playing, loop inside the window and move the playhead with it.
+  useEffect(() => {
+    if (!playing) return;
+    let frame = 0;
+    const tick = () => {
+      const element = videoRef.current;
+      if (!element) return;
+      const { start: from, end: to } = windowRef.current;
+      if (element.currentTime >= to || element.currentTime < from - 0.25) element.currentTime = from;
+      setPlayhead(element.currentTime);
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [playing]);
 
   /* ---------------------------------- apply --------------------------------- */
 
@@ -174,7 +228,11 @@ export function TrimModal({ kind, media, minDuration, maxDuration, duration, onC
     const seconds = Math.max(minWindow, end - start);
     const output = Math.min(maxDuration, Math.max(minDuration, Math.round(seconds)));
 
-    if (kind === "video" || !audioRef.current) {
+    if (kind === "video") {
+      onApply({ duration: output, start });
+      return;
+    }
+    if (!audioRef.current) {
       onApply({ duration: output });
       return;
     }
@@ -195,7 +253,22 @@ export function TrimModal({ kind, media, minDuration, maxDuration, duration, onC
   }
 
   return (
-    <div className="overlay" role="dialog" aria-modal="true" aria-label={`Trim ${kind}`} onClick={onClose}>
+    <div
+      className="overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Trim ${kind}`}
+      onPointerDown={(event) => {
+        backdropPress.current = event.target === event.currentTarget;
+      }}
+      onClick={() => {
+        // A trim drag can end outside the panel, and the browser then reports
+        // the click on the backdrop; only a press that started there closes.
+        if (!backdropPress.current) return;
+        backdropPress.current = false;
+        onClose();
+      }}
+    >
       <div className="modal trim-panel" onClick={(event) => event.stopPropagation()}>
         <header>
           <h2>Trim</h2>
@@ -205,6 +278,26 @@ export function TrimModal({ kind, media, minDuration, maxDuration, duration, onC
         </header>
 
         <div className="trim-preview">
+          {kind === "video" && total > 0 && (
+            <button
+              type="button"
+              className={`trim-play${playing ? " is-playing" : ""}`}
+              aria-label={playing ? "Pause" : "Play the trimmed part"}
+              title={playing ? "Pause" : "Play the trimmed part"}
+              onClick={togglePlay}
+            >
+              {playing ? (
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true">
+                  <rect x="6" y="5" width="4" height="14" rx="1" />
+                  <rect x="14" y="5" width="4" height="14" rx="1" />
+                </svg>
+              ) : (
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true">
+                  <path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z" />
+                </svg>
+              )}
+            </button>
+          )}
           {kind === "video" ? (
             <video
               ref={videoRef}
@@ -213,6 +306,9 @@ export function TrimModal({ kind, media, minDuration, maxDuration, duration, onC
               playsInline
               preload="metadata"
               onLoadedMetadata={onLoadedMetadata}
+              onPlay={() => setPlaying(true)}
+              onPause={() => setPlaying(false)}
+              onEnded={() => setPlaying(false)}
               onError={() => setError("This browser could not decode that clip for the preview.")}
             />
           ) : (
@@ -231,6 +327,7 @@ export function TrimModal({ kind, media, minDuration, maxDuration, duration, onC
           end={end}
           min={minWindow}
           max={maxDuration}
+          positionStep={POSITION_STEP}
           disabled={total > 0 && total <= minWindow}
           onWindow={(nextStart, nextEnd) => {
             setStart(nextStart);
@@ -239,17 +336,20 @@ export function TrimModal({ kind, media, minDuration, maxDuration, duration, onC
           onPreview={previewAt}
         >
           {kind === "audio" && <canvas ref={waveRef} className="trim-wave" />}
+          {playing && playhead !== undefined && total > 0 && (
+            <span className="trim-playhead" style={{ left: `${(playhead / total) * 100}%` }} aria-hidden="true" />
+          )}
         </TrimTrack>
 
         <div className="trim-readout">
           <span>
-            <b>{clock(start)}</b> → <b>{clock(end)}</b>
+            <b>{stamp(start)}</b> → <b>{stamp(end)}</b>
           </span>
           <strong>{clock(length)}</strong>
         </div>
         {shorter && (
           <p className="trim-note">
-            This reference is {clock(length)}; the model outputs {outputSeconds}s.
+            Reference is {clock(length)}; output is {outputSeconds}s.
           </p>
         )}
         {error && <p className="panel-status error">{error}</p>}

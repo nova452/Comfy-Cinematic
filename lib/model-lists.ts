@@ -22,17 +22,30 @@ export type LoaderList = { ok: true; options: string[] } | { ok: false; status: 
 /** A name no install can have, so validation always refuses it. */
 export const PROBE_NAME = "__cinematic_probe__.safetensors";
 
-/** The loader the probe reads back, by class rather than by node id. */
-const PROBE_CLASSES = { unet: "UNETLoader", clip: "CLIPLoader" } as const;
+/** Each list the probe reads back: its loader class and that loader's file field. */
+const PROBE_LOADERS = {
+  unet: { class_type: "UNETLoader", field: "unet_name" },
+  clip: { class_type: "CLIPLoader", field: "clip_name" },
+  lora: { class_type: "LoraLoaderModelOnly", field: "lora_name" },
+  upscaler: { class_type: "LatentUpscaleModelLoader", field: "model_name" },
+} as const;
+
+export type LoaderKind = keyof typeof PROBE_LOADERS;
+export type LoaderLists = Partial<Record<LoaderKind, string[]>>;
 
 /**
  * The probe: both loaders wired — through a text encoder, a guider and one
  * sampler step — into a `SaveImage`, so the graph has an output and every node
  * is reachable. Unconnected nodes are never validated, which is why a bare
  * loader node would answer nothing.
+ *
+ * `extras` also wires a LoRA into the model and H3's latent upscaler in front
+ * of the sampler, for Openjutsu's LoRA and upscaler lists. The upscale node is
+ * core, but only in a ComfyUI recent enough for H3, so it is asked for only by
+ * the gear that needs it.
  */
-export function probeGraph() {
-  return {
+export function probeGraph(extras = false) {
+  const graph: Record<string, { class_type: string; inputs: Record<string, unknown> }> = {
     "1": { class_type: "UNETLoader", inputs: { unet_name: PROBE_NAME, weight_dtype: "default" } },
     "2": { class_type: "EmptyLatentImage", inputs: { width: 64, height: 64, batch_size: 1 } },
     "3": { class_type: "KSamplerSelect", inputs: { sampler_name: "euler" } },
@@ -49,6 +62,17 @@ export function probeGraph() {
     "11": { class_type: "VAEDecode", inputs: { samples: ["10", 0], vae: ["9", 0] } },
     "12": { class_type: "SaveImage", inputs: { images: ["11", 0], filename_prefix: "cinematic/verify-probe" } },
   };
+  if (extras) {
+    graph["13"] = { class_type: "LoraLoaderModelOnly", inputs: { model: ["1", 0], lora_name: PROBE_NAME, strength_model: 1 } };
+    graph["14"] = { class_type: "LatentUpscaleModelLoader", inputs: { model_name: PROBE_NAME } };
+    graph["15"] = {
+      class_type: "MiniMaxH3LatentUpscaleWithModel",
+      inputs: { model: ["14", 0], samples: ["2", 0], width: 64, height: 64 },
+    };
+    graph["6"]!.inputs.model = ["13", 0];
+    graph["10"]!.inputs.latent_image = ["15", 0];
+  }
+  return graph;
 }
 
 /** `unet_name: 'x' not in ['a', 'b']` → `["a", "b"]`. */
@@ -71,8 +95,8 @@ export function parseNotInList(details: string, field: string): string[] | undef
  * ComfyUI keys those by node id and each entry carries the class, so the probe
  * does not depend on its own node numbering surviving a change to the graph.
  */
-export function listsFromNodeErrors(nodeErrors: unknown): { unet?: string[]; clip?: string[] } {
-  const out: { unet?: string[]; clip?: string[] } = {};
+export function listsFromNodeErrors(nodeErrors: unknown): LoaderLists {
+  const out: LoaderLists = {};
   if (!nodeErrors || typeof nodeErrors !== "object") return out;
 
   for (const entry of Object.values(nodeErrors as Record<string, unknown>)) {
@@ -81,11 +105,8 @@ export function listsFromNodeErrors(nodeErrors: unknown): { unet?: string[]; cli
     for (const item of errors) {
       const details = (item as { details?: unknown })?.details;
       if (typeof details !== "string") continue;
-      if (detail.class_type === PROBE_CLASSES.unet && !out.unet) {
-        out.unet = parseNotInList(details, "unet_name");
-      }
-      if (detail.class_type === PROBE_CLASSES.clip && !out.clip) {
-        out.clip = parseNotInList(details, "clip_name");
+      for (const [kind, loader] of Object.entries(PROBE_LOADERS) as [LoaderKind, (typeof PROBE_LOADERS)[LoaderKind]][]) {
+        if (detail.class_type === loader.class_type && !out[kind]) out[kind] = parseNotInList(details, loader.field);
       }
     }
   }
@@ -109,13 +130,14 @@ export async function probeLoaderLists(
   base: string,
   key: string | undefined,
   timeoutMs = 25_000,
-): Promise<{ unet?: string[]; clip?: string[] } | undefined> {
+  extras = false,
+): Promise<LoaderLists | undefined> {
   const root = base.replace(/\/+$/, "");
 
   const submit = await fetch(`${root}/api/v2/jobs`, {
     method: "POST",
     headers: { ...authHeaders(key, true), "Idempotency-Key": randomUUID() },
-    body: JSON.stringify({ workflow: probeGraph() }),
+    body: JSON.stringify({ workflow: probeGraph(extras) }),
     cache: "no-store",
     signal: AbortSignal.timeout(20_000),
     redirect: redirectMode(),
@@ -151,7 +173,8 @@ export async function probeLoaderLists(
   return undefined;
 }
 
-/** `GET /object_info/<loader>` — the widget's enum, on a target that has it. */async function objectInfo(base: string, key: string | undefined, node: string, field: string): Promise<LoaderList> {
+/** `GET /object_info/<loader>` — the widget's enum, on a target that has it. */
+async function objectInfo(base: string, key: string | undefined, node: string, field: string): Promise<LoaderList> {
   const response = await fetch(`${base}/object_info/${node}`, {
     headers: authHeaders(key),
     cache: "no-store",
@@ -171,30 +194,34 @@ export async function probeLoaderLists(
 }
 
 /**
- * The UNET and CLIP lists one target offers, whichever surface it speaks.
+ * The UNET and CLIP lists one target offers, whichever surface it speaks, and
+ * with `extras` its LoRA and latent upscaler lists too.
  *
  * `/object_info` first; when it is missing — 404 from a bare v2 gateway, 405
- * from a static fallback — the probe supplies the same two lists.
+ * from a static fallback — the probe supplies the same lists.
  */
 export async function loaderLists(
   base: string,
   key?: string,
-): Promise<{ unet: LoaderList; clip: LoaderList }> {
-  const [unet, clip] = await Promise.all([
-    objectInfo(base, key, "UNETLoader", "unet_name"),
-    objectInfo(base, key, "CLIPLoader", "clip_name"),
-  ]);
+  extras = false,
+): Promise<{ unet: LoaderList; clip: LoaderList; lora?: LoaderList; upscaler?: LoaderList }> {
+  const kinds: LoaderKind[] = extras ? ["unet", "clip", "lora", "upscaler"] : ["unet", "clip"];
+  const fetched = await Promise.all(
+    kinds.map((kind) => objectInfo(base, key, PROBE_LOADERS[kind].class_type, PROBE_LOADERS[kind].field)),
+  );
+  const lists = Object.fromEntries(kinds.map((kind, index) => [kind, fetched[index]!])) as Record<LoaderKind, LoaderList>;
+  const { unet, clip } = lists;
 
   const missingRoute = (list: LoaderList) => !list.ok && (list.status === 404 || list.status === 405);
   if (!unet.ok && !clip.ok && (missingRoute(unet) || missingRoute(clip))) {
-    const probed = await probeLoaderLists(base, key);
+    const probed = await probeLoaderLists(base, key, undefined, extras);
     if (probed) {
-      return {
-        unet: probed.unet ? { ok: true, options: probed.unet } : unet,
-        clip: probed.clip ? { ok: true, options: probed.clip } : clip,
-      };
+      for (const kind of kinds) {
+        const options = probed[kind];
+        if (options) lists[kind] = { ok: true, options };
+      }
     }
   }
 
-  return { unet, clip };
+  return lists;
 }

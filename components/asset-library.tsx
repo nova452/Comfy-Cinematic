@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   ASSET_KINDS,
@@ -15,11 +15,54 @@ import {
   type LibraryFilter,
 } from "../lib/assets";
 import { MAX_INPUT_BYTES, MAX_MEDIA_MB, prepareMedia, saveUpload } from "../lib/client-image";
-import { mediaUrl, useMediaVersion } from "../lib/browser-media";
+import { useMediaUrl } from "../lib/browser-media";
 import { AssetTile, CloudIcon, KindIcon, PendingTile } from "./asset-tile";
+import { useNearViewport } from "./near-viewport";
 
 /** One file dialog for every kind the library holds. */
 const ACCEPT_ALL = ASSET_KINDS.map((kind) => acceptFor(kind)).join(",");
+
+/**
+ * Tiles mounted at a time, and how many more each scroll to the bottom adds.
+ * The grid is the whole library, uncapped, so it grows as you read it rather
+ * than mounting every tile the moment the tab opens.
+ */
+const PAGE_SIZE = 24;
+
+type LibraryTileProps = {
+  asset: Asset;
+  liked: boolean;
+  disabled: boolean;
+  onOpen: (asset: Asset) => void;
+  onToggleLike: (id: string) => void;
+};
+
+/**
+ * A tile bound to its asset, so the handlers it hands down stay the same
+ * between renders and an unchanged tile skips the render altogether.
+ */
+const LibraryTile = memo(function LibraryTile({ asset, liked, disabled, onOpen, onToggleLike }: LibraryTileProps) {
+  const open = useCallback(() => onOpen(asset), [onOpen, asset]);
+  const toggle = useCallback(() => onToggleLike(asset.id), [onToggleLike, asset.id]);
+  return <AssetTile asset={asset} liked={liked} disabled={disabled} onOpen={open} onToggleLike={toggle} />;
+});
+
+/** The full-size view, holding its own blob subscription. */
+function ViewerMedia({ asset }: { asset: Asset }) {
+  const url = useMediaUrl(asset.src);
+  if (asset.kind === "image") return <img src={url} alt={asset.note ?? asset.name} draggable={false} />;
+  if (asset.kind === "video") return <video src={url} controls autoPlay loop playsInline preload="metadata" />;
+  return <audio src={url} controls autoPlay />;
+}
+
+function ViewerDownload({ asset }: { asset: Asset }) {
+  const url = useMediaUrl(asset.src);
+  return (
+    <a className="button-link primary" href={url} download={asset.name}>
+      Download
+    </a>
+  );
+}
 
 /** A render that is running right now, as far as this panel cares. */
 export type PendingAsset = { id: string; kind: "image" | "video"; prompt: string };
@@ -39,7 +82,8 @@ type Props = {
   liked: string[];
   /** Renders in flight, so the library shows the gap they leave. */
   pending: PendingAsset[];
-  busy?: boolean;
+  /** Stop a render in flight, by its pending id. */
+  onCancelPending?: (id: string) => void;
   onUpload: (asset: Asset) => void;
   onToggleLike: (id: string) => void;
 };
@@ -52,21 +96,42 @@ type Props = {
  * newest-first — the kind badge on each tile is all the grouping it needs —
  * with a pill per kind for when you only want stills, clips or tracks.
  */
-export function AssetLibrary({ uploads, renders, liked, pending, busy, onUpload, onToggleLike }: Props) {
-  // Tiles and the full-size viewer fill in as their blobs are read.
-  useMediaVersion();
+export const AssetLibrary = memo(function AssetLibrary({
+  uploads,
+  renders,
+  liked,
+  pending,
+  onCancelPending,
+  onUpload,
+  onToggleLike,
+}: Props) {
+  // Each tile and the viewer subscribe to their own blob, so this panel does
+  // not re-render as the library's media streams in.
   const [tab, setTab] = useState<AssetTab>("uploads");
   const [filter, setFilter] = useState<LibraryFilter>("recent");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState<string>();
   const [viewing, setViewing] = useState<Asset | null>(null);
+  const [limit, setLimit] = useState(PAGE_SIZE);
   const inputRef = useRef<HTMLInputElement>(null);
+  const [sentinelRef, atEnd] = useNearViewport<HTMLDivElement>({ once: false, margin: "600px" });
 
-  const disabled = Boolean(busy) || working;
+  const disabled = working;
   const shown = useMemo(
     () => pickLibrary({ uploads, renders, liked }, tab, filter),
     [uploads, renders, liked, tab, filter],
   );
+  const likedSet = useMemo(() => new Set(liked), [liked]);
+  const visible = shown.length > limit ? shown.slice(0, limit) : shown;
+  const hasMore = shown.length > limit;
+
+  // Grow while the bottom is in reach; still in reach after a page lands
+  // (a tall panel) means the next page follows on the next render.
+  useEffect(() => {
+    if (atEnd && hasMore) setLimit((current) => current + PAGE_SIZE);
+  }, [atEnd, hasMore, limit]);
+
+  const open = useCallback((asset: Asset) => setViewing(asset), []);
   // A render in flight is the newest thing the library has, so it leads.
   const running = pending.filter((item) => filter === "recent" || item.kind === filter);
   const filters = libraryFilters(tab);
@@ -143,6 +208,7 @@ export function AssetLibrary({ uploads, renders, liked, pending, busy, onUpload,
                 className={tab === item.id ? "is-active" : ""}
                 onClick={() => {
                   setTab(item.id);
+                  setLimit(PAGE_SIZE);
                   // Audio is upload-only, so landing on Output with it still
                   // selected would leave the grid empty with no way back.
                   if (item.id === "generations" && filter === "audio") setFilter("recent");
@@ -173,7 +239,10 @@ export function AssetLibrary({ uploads, renders, liked, pending, busy, onUpload,
               role="tab"
               aria-selected={filter === item.id}
               className={filter === item.id ? "is-active" : ""}
-              onClick={() => setFilter(item.id)}
+              onClick={() => {
+                setFilter(item.id);
+                setLimit(PAGE_SIZE);
+              }}
               disabled={disabled}
             >
               {item.label}
@@ -183,17 +252,22 @@ export function AssetLibrary({ uploads, renders, liked, pending, busy, onUpload,
 
         <div className="asset-grid">
           {running.map((slot) => (
-            <PendingTile key={slot.id} kind={slot.kind} prompt={slot.prompt} />
+            <PendingTile
+              key={slot.id}
+              kind={slot.kind}
+              prompt={slot.prompt}
+              {...(onCancelPending ? { onCancel: () => onCancelPending(slot.id) } : {})}
+            />
           ))}
 
-          {shown.map((asset) => (
-            <AssetTile
+          {visible.map((asset) => (
+            <LibraryTile
               key={asset.id}
               asset={asset}
-              liked={liked.includes(asset.id)}
+              liked={likedSet.has(asset.id)}
               disabled={disabled}
-              onOpen={() => setViewing(asset)}
-              onToggleLike={() => onToggleLike(asset.id)}
+              onOpen={open}
+              onToggleLike={onToggleLike}
             />
           ))}
 
@@ -201,6 +275,8 @@ export function AssetLibrary({ uploads, renders, liked, pending, busy, onUpload,
             <p className="asset-empty">{emptyCopy(filter, tab)}</p>
           )}
         </div>
+
+        {hasMore && <div className="asset-more" ref={sentinelRef} aria-hidden="true" />}
 
         {error && (
           <p className="asset-error" role="alert">
@@ -234,13 +310,7 @@ export function AssetLibrary({ uploads, renders, liked, pending, busy, onUpload,
           >
             <div className="viewer" onClick={(event) => event.stopPropagation()}>
               <div className="viewer-media">
-                {viewing.kind === "image" ? (
-                  <img src={mediaUrl(viewing.src)} alt={viewing.note ?? viewing.name} draggable={false} />
-                ) : viewing.kind === "video" ? (
-                  <video src={mediaUrl(viewing.src)} controls autoPlay loop playsInline preload="metadata" />
-                ) : (
-                  <audio src={mediaUrl(viewing.src)} controls autoPlay />
-                )}
+                <ViewerMedia asset={viewing} />
               </div>
 
               <aside className="viewer-panel">
@@ -278,9 +348,7 @@ export function AssetLibrary({ uploads, renders, liked, pending, busy, onUpload,
                 </div>
 
                 <div className="viewer-actions">
-                  <a className="button-link primary" href={mediaUrl(viewing.src)} download={viewing.name}>
-                    Download
-                  </a>
+                  <ViewerDownload asset={viewing} />
                 </div>
               </aside>
             </div>
@@ -289,4 +357,4 @@ export function AssetLibrary({ uploads, renders, liked, pending, busy, onUpload,
         )}
     </>
   );
-}
+});

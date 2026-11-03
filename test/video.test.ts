@@ -16,26 +16,38 @@ import {
   h3TierModels,
   isReferenceCaption,
   lockedByMode,
+  OPENJUTSU_MODEL_ID,
+  placeWindow,
   ratioOptions,
   resolutionOptions,
   snapWindow,
   standaloneVideoModels,
+  supportsContinuation,
   usesKeyframes,
+  videoRatioForSize,
   videoRatioLabel,
   videoResultError,
   videoResultUrl,
 } from "../lib/video.ts";
 
 test("minimax h3 is the registered video model", () => {
-  assert.equal(DEFAULT_VIDEO_MODEL.id, "minimax/minimax-h3");
-  assert.equal(findVideoModel("minimax/minimax-h3")?.label, "MiniMax H3");
+  const router = findVideoModel("minimax/minimax-h3")!;
+  assert.equal(router.label, "MiniMax H3");
   assert.equal(findVideoModel("nope"), undefined);
   assert.deepEqual(
-    DEFAULT_VIDEO_MODEL.modes,
+    router.modes,
     VIDEO_MODES.map((mode) => mode.id),
   );
-  assert.equal(DEFAULT_VIDEO_MODEL.provider, "router");
-  assert.equal(VIDEO_MODELS.length, 4);
+  assert.equal(router.provider, "router");
+  assert.equal(VIDEO_MODELS.length, 5);
+});
+
+test("the panel opens on Openjutsu, the picker's first row", () => {
+  assert.equal(DEFAULT_VIDEO_MODEL.id, "local/openjutsu");
+  assert.equal(DEFAULT_VIDEO_MODEL.label, "Openjutsu Prime");
+  // Its single mode is Video Reference, so the panel must not open on Free.
+  assert.deepEqual(DEFAULT_VIDEO_MODEL.modes, ["video"]);
+  assert.equal(DEFAULT_VIDEO_MODEL.provider, "local");
 });
 
 test("the h3 card groups three router tiers, original first", () => {
@@ -49,10 +61,10 @@ test("the h3 card groups three router tiers, original first", () => {
     ["minimax/minimax-h3", "fal/h3-max", "fal/h3-max-turbo"],
   );
   assert.ok(tiers.every((tier) => tier.model.family === "MiniMax H3"));
-  // Only the local graph sits outside the card.
+  // Only the local graphs sit outside the card.
   assert.deepEqual(
     standaloneVideoModels().map((model) => model.id),
-    ["local/minimax-h3"],
+    ["local/minimax-h3", "local/openjutsu"],
   );
 });
 
@@ -78,22 +90,37 @@ test("the local h3 keeps every reference mode", () => {
   assert.equal(local.provider, "local");
   assert.equal(local.label, "MiniMax H3 Local");
   assert.deepEqual(local.modes, ["free", "audio", "video"]);
-  assert.equal(local.ratio, DEFAULT_VIDEO_MODEL.ratio);
-  assert.equal(local.resolution, DEFAULT_VIDEO_MODEL.resolution);
+  assert.equal(local.ratio, "16:9");
+  assert.equal(local.resolution, "768P");
   assert.ok(VIDEO_MODELS.every((model) => model.provider === (model.id.startsWith("local/") ? "local" : "router")));
   assert.equal(new Set(VIDEO_MODELS.map((model) => model.id)).size, VIDEO_MODELS.length);
 });
 
+test("only the h3 entries continue a clip; Openjutsu has no continuation", () => {
+  // Continue extends a clip on the plain H3 stack, on Router or locally.
+  assert.equal(supportsContinuation(findVideoModel("local/minimax-h3")!), true);
+  assert.equal(supportsContinuation(findVideoModel("minimax/minimax-h3")!), true);
+  // Openjutsu casts characters into a clip rather than extending one, so its
+  // single Video Reference mode does not make it a continuation model.
+  assert.equal(supportsContinuation(findVideoModel(OPENJUTSU_MODEL_ID)!), false);
+  // The fal tiers take a prompt and nothing else: no clip to extend.
+  assert.equal(supportsContinuation(findVideoModel("fal/h3-max")!), false);
+  assert.equal(supportsContinuation(findVideoModel("fal/h3-max-turbo")!), false);
+});
+
 test("each h3 entry offers only the resolutions it can actually take", () => {
+  const router = findVideoModel("minimax/minimax-h3")!;
   // Router rejects everything but these two spellings with a 400.
-  assert.deepEqual(DEFAULT_VIDEO_MODEL.resolutions, ["768P", "2K"]);
+  assert.deepEqual(router.resolutions, ["768P", "2K"]);
   const local = findVideoModel("local/minimax-h3")!;
   assert.deepEqual(local.resolutions, ["480P", "768P"]);
+  // The default (Openjutsu) shares the local graph's set.
+  assert.deepEqual(DEFAULT_VIDEO_MODEL.resolutions, ["480P", "768P"]);
 
-  assert.equal(findVideoResolution("2K", DEFAULT_VIDEO_MODEL.resolution, DEFAULT_VIDEO_MODEL.resolutions), "2K");
-  assert.equal(findVideoResolution("2k", DEFAULT_VIDEO_MODEL.resolution, DEFAULT_VIDEO_MODEL.resolutions), "2K");
+  assert.equal(findVideoResolution("2K", router.resolution, router.resolutions), "2K");
+  assert.equal(findVideoResolution("2k", router.resolution, router.resolutions), "2K");
   // 480P is not in Router's set, so it clamps rather than being sent.
-  assert.equal(findVideoResolution("480P", DEFAULT_VIDEO_MODEL.resolution, DEFAULT_VIDEO_MODEL.resolutions), "768P");
+  assert.equal(findVideoResolution("480P", router.resolution, router.resolutions), "768P");
   // ...and 2K is not in the local graph's set, so the same clamp runs the other way.
   assert.equal(findVideoResolution("2K", local.resolution, local.resolutions), "768P");
   assert.equal(findVideoResolution("480p", local.resolution, local.resolutions), "480P");
@@ -118,6 +145,24 @@ test("an unknown ratio falls back to 16:9", () => {
   assert.equal(findVideoRatio("4:5").id, "16:9");
   assert.equal(findVideoRatio(undefined).id, "16:9");
   assert.equal(findVideoRatio("nonsense", "1:1").id, "1:1");
+});
+
+test("a reference clip is rendered at its own shape", () => {
+  // The locked chip shows the clip's ratio, not whatever the panel was left on.
+  assert.equal(videoRatioForSize(1920, 1080), "16:9");
+  assert.equal(videoRatioForSize(1080, 1920), "9:16");
+  assert.equal(videoRatioForSize(1080, 1080), "1:1");
+  assert.equal(videoRatioForSize(1440, 1080), "4:3");
+  assert.equal(videoRatioForSize(1080, 1440), "3:4");
+
+  // A shape the models do not take lands on the nearest one they do.
+  assert.equal(videoRatioForSize(2390, 1000), "16:9");
+  assert.equal(videoRatioForSize(1400, 1000), "4:3");
+
+  // Nothing to read is not a ratio, and Auto is never the answer: a clip has a shape.
+  assert.equal(videoRatioForSize(0, 1080), undefined);
+  assert.equal(videoRatioForSize(Number.NaN, 1080), undefined);
+  assert.notEqual(videoRatioForSize(1920, 1080), "adaptive");
 });
 
 test("the chosen ratio reaches Router, and Auto becomes 16:9", () => {
@@ -159,6 +204,22 @@ test("the clip editor can snap to tenths of a second", () => {
   assert.deepEqual(snapWindow(0, 9.97, 10, 0.5, 15, 0.1), { start: 0, end: 10 });
   // A selection shorter than the floor grows to the floor.
   assert.deepEqual(snapWindow(0, 0.3, 10, 0.5, 15, 0.1), { start: 0, end: 0.5 });
+});
+
+test("a dragged window glides in fine steps but keeps a whole-second length", () => {
+  // Moving: the position follows the pointer to 0.05s, the length stays 5s.
+  assert.deepEqual(placeWindow("move", 3.37, 8.37, 20, 5, 15, 1, 0.05), { start: 3.35, end: 8.35 });
+  // Pushed past either end, it stops at the media's edge.
+  assert.deepEqual(placeWindow("move", -2, 3, 20, 5, 15, 1, 0.05), { start: 0, end: 5 });
+  assert.deepEqual(placeWindow("move", 17.3, 22.3, 20.4, 5, 15, 1, 0.05), { start: 15.4, end: 20.4 });
+  // A handle changes the length in whole seconds and holds the far edge.
+  assert.deepEqual(placeWindow("end", 3.35, 9.9, 20, 5, 15, 1, 0.05), { start: 3.35, end: 10.35 });
+  assert.deepEqual(placeWindow("start", 1.2, 10.35, 20, 5, 15, 1, 0.05), { start: 1.35, end: 10.35 });
+  // Never shorter than the model's minimum, never longer than its maximum.
+  assert.deepEqual(placeWindow("end", 2, 3, 20, 5, 15, 1, 0.05), { start: 2, end: 7 });
+  assert.deepEqual(placeWindow("start", 0, 18, 30, 5, 15, 1, 0.05), { start: 3, end: 18 });
+  // A longer window than the room left slides back instead of overrunning.
+  assert.deepEqual(placeWindow("end", 17.5, 19, 20, 5, 15, 1, 0.05), { start: 15, end: 20 });
 });
 
 test("the window stays inside the media and the model limit", () => {

@@ -15,6 +15,13 @@ test("the settings header survives a round trip", () => {
   const settings = {
     account: ACCOUNT,
     localModel: { unet: "a.safetensors", clip: "b.safetensors", steps: 12 },
+    openjutsu: {
+      unet: "e.safetensors",
+      clip: "f.safetensors",
+      steps: 16,
+      openRouterKey: "sk-or-key",
+      openjutsuMode: "light",
+    },
     localImage: { unet: "c.safetensors", clip: "d.safetensors", steps: 20 },
   };
 
@@ -75,6 +82,75 @@ test("stored local model names are clamped the way a render would be", () => {
   assert.equal(settings.localModel?.unet, "a");
   assert.equal(settings.account?.key, ACCOUNT.key);
   assert.equal(settings.localImage, undefined);
+});
+
+test("an OpenRouter key saved before the split moves to Openjutsu's own record", () => {
+  const settings = normalizeStoredSettings({
+    localModel: {
+      unet: "h3.safetensors",
+      clip: "clip.safetensors",
+      steps: 8,
+      refVideoEdge: 480,
+      openRouterKey: "sk-or-legacy",
+    },
+  });
+
+  // The key now belongs to Openjutsu, which starts from the old shared files.
+  assert.equal(settings.openjutsu?.openRouterKey, "sk-or-legacy");
+  assert.equal(settings.openjutsu?.unet, "h3.safetensors");
+  assert.equal(settings.localModel?.openRouterKey, undefined);
+  assert.equal(settings.localModel?.refVideoEdge, 480);
+
+  // Once Openjutsu has its own record, the two are independent.
+  const split = normalizeStoredSettings({
+    localModel: { unet: "h3.safetensors", clip: "clip.safetensors", steps: 8 },
+    openjutsu: { unet: "ref5.safetensors", clip: "ref5-clip.safetensors", steps: 12, openRouterKey: "sk-or-own" },
+  });
+  assert.equal(split.localModel?.unet, "h3.safetensors");
+  assert.equal(split.openjutsu?.unet, "ref5.safetensors");
+  assert.equal(split.openjutsu?.openRouterKey, "sk-or-own");
+});
+
+test("each local video model reads its own settings header record", async () => {
+  const { readLocalConfig, readOpenjutsuConfig } = await import("../lib/local-config.ts");
+  const request = new Request("http://localhost/api/video", {
+    headers: {
+      [SETTINGS_HEADER]: encodeSettings({
+        localModel: { unet: "h3.safetensors", clip: "h3-clip.safetensors", steps: 8 },
+        openjutsu: {
+          unet: "ref5.safetensors",
+          clip: "ref5-clip.safetensors",
+          steps: 12,
+          openRouterKey: "sk-or-own",
+          openjutsuMode: "light",
+        },
+      }),
+    },
+  });
+  const env = {} as NodeJS.ProcessEnv;
+
+  const local = await readLocalConfig(request, env);
+  assert.equal(local.unet, "h3.safetensors");
+  assert.equal(local.openRouterKey, undefined);
+
+  const openjutsu = await readOpenjutsuConfig(request, env);
+  assert.equal(openjutsu.unet, "ref5.safetensors");
+  assert.equal(openjutsu.steps, 12);
+  assert.equal(openjutsu.openRouterKey, "sk-or-own");
+  assert.equal(openjutsu.openjutsuMode, "light");
+
+  // A header written before the split has only `localModel`; Openjutsu still
+  // reads it, so its key and file names keep working until it is saved once.
+  const legacy = new Request("http://localhost/api/video", {
+    headers: {
+      [SETTINGS_HEADER]: encodeSettings({
+        localModel: { unet: "old.safetensors", clip: "old-clip.safetensors", steps: 8, openRouterKey: "sk-or-old" },
+      }),
+    },
+  });
+  const fallback = await readOpenjutsuConfig(legacy, env);
+  assert.equal(fallback.unet, "old.safetensors");
+  assert.equal(fallback.openRouterKey, "sk-or-old");
 });
 
 test("this browser's settings survive a write and a read", () => {
