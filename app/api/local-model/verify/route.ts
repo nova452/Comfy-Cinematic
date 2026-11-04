@@ -3,11 +3,11 @@ import { activeEndpoint, envLocalKey, envRouterKey, readAccount } from "../../..
 import { readLocalConfig, readOpenjutsuConfig } from "../../../../lib/local-config";
 import { loaderLists, type LoaderList } from "../../../../lib/model-lists";
 import { ref6Files } from "../../../../lib/ref5";
-import { OPENJUTSU_REFINER_LORAS, isRefinerLora } from "../../../../lib/video";
+import { findExtrasFile, type ExtrasFileKey } from "../../../../lib/video";
 
 /** One more file Openjutsu loads; `key` names the Extras field it belongs to, if any. */
 type FileCheck = {
-  key: "ref2vaUnet" | "ref2vaLora" | "latentUpscaler" | "refinerLora";
+  key: ExtrasFileKey;
   label: string;
   name: string;
   found?: boolean;
@@ -99,32 +99,43 @@ export async function POST(request: Request) {
   }
 
   // Openjutsu also loads the pass-2 checkpoint and LoRA, the latent upscaler
-  // and the refiner LoRA. The refiner comes in two ranks and either will do:
-  // the one the target lists is reported back, and the dialog saves it.
+  // and the refiner LoRA. A target may register a release under another name
+  // than the deployment does — a desktop install's Pika LoRA is the same file
+  // with another spelling, folder or precision — so each is matched by role,
+  // and the name reported back is the one the target lists, which the dialog
+  // saves and the graph then sends.
   let files: FileCheck[] | undefined;
-  let refinerLora: string | undefined;
   if (openjutsu) {
     const names = ref6Files({ ref2vaUnet, ref2vaLora, latentUpscaler, refinerLora: wantedRefiner });
-    const has = (list: LoaderList | undefined, name: string) => (list?.ok ? list.options.includes(name) : undefined);
-    const listed = lora?.ok ? lora.options.filter(isRefinerLora) : [];
-    // The one asked for if the target has it, else the first release it does.
-    refinerLora =
-      (wantedRefiner && lora?.ok && lora.options.includes(wantedRefiner) ? wantedRefiner : undefined) ??
-      OPENJUTSU_REFINER_LORAS.map((release) => listed.find((name) => name.endsWith(release))).find(Boolean);
+    const match = (list: LoaderList | undefined, key: ExtrasFileKey) =>
+      list?.ok ? findExtrasFile(key, names[key], list.options) : undefined;
+    const found = (list: LoaderList | undefined, key: ExtrasFileKey) =>
+      list?.ok ? Boolean(match(list, key)) : undefined;
+    const reported = (list: LoaderList | undefined, key: ExtrasFileKey) => match(list, key) ?? names[key];
     files = [
-      { key: "ref2vaUnet", label: "Second pass model", name: names.ref2vaUnet, found: has(unet, names.ref2vaUnet) },
-      { key: "ref2vaLora", label: "Second pass LoRA", name: names.ref2vaLora, found: has(lora, names.ref2vaLora) },
+      {
+        key: "ref2vaUnet",
+        label: "Second pass model",
+        name: reported(unet, "ref2vaUnet"),
+        found: found(unet, "ref2vaUnet"),
+      },
+      {
+        key: "ref2vaLora",
+        label: "Second pass LoRA",
+        name: reported(lora, "ref2vaLora"),
+        found: found(lora, "ref2vaLora"),
+      },
       {
         key: "latentUpscaler",
         label: "Latent upscaler",
-        name: names.latentUpscaler,
-        found: has(upscaler, names.latentUpscaler),
+        name: reported(upscaler, "latentUpscaler"),
+        found: found(upscaler, "latentUpscaler"),
       },
       {
         key: "refinerLora",
         label: "Refiner LoRA",
-        name: refinerLora ?? OPENJUTSU_REFINER_LORAS.join(" or "),
-        found: lora?.ok ? Boolean(refinerLora) : undefined,
+        name: reported(lora, "refinerLora"),
+        found: found(lora, "refinerLora"),
       },
     ];
   }
@@ -138,7 +149,6 @@ export async function POST(request: Request) {
     unet: { name: unetName, found: unet.ok ? unet.options.includes(unetName) : undefined },
     clip: { name: clipName, found: clip.ok ? clip.options.includes(clipName) : undefined },
     ...(files ? { files } : {}),
-    ...(refinerLora ? { refinerLora } : {}),
     note: missingList ? "Some loader lists were unavailable; the rest were checked." : undefined,
   });
 }

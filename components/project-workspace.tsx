@@ -1861,7 +1861,6 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         unet?: { name: string; found?: boolean };
         clip?: { name: string; found?: boolean };
         files?: { key: ExtrasKey; label: string; name: string; found?: boolean }[];
-        refinerLora?: string;
         note?: string;
         error?: string;
       };
@@ -1870,9 +1869,17 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         return;
       }
       setVerifyResult(data);
-      // Either refiner rank works; keep the one this target has for Save.
-      const refinerLora = data.refinerLora;
-      if (refinerLora) setLocalDraft((current) => ({ ...current, refinerLora }));
+      // A target may list a file under its own name — another folder, rank or
+      // spelling. Adopt the names Verify reported so Save stores the registered
+      // name and the graph sends what the target has, not the gear's guess.
+      const found = (data.files ?? []).filter((file) => file.found === true);
+      if (found.length > 0) {
+        setLocalDraft((current) => {
+          const next = { ...current };
+          for (const file of found) next[file.key] = file.name;
+          return next;
+        });
+      }
     } catch {
       setVerifyResult({ error: "Could not reach the app server." });
     } finally {

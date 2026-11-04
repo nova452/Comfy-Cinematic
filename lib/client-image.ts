@@ -141,16 +141,27 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   ogg: "audio/ogg",
 };
 
-/** Blob types can be empty (object URLs of some files), so names fill in. */
-function mediaMime(name: string, type?: string) {
+/**
+ * Blob types can be empty (object URLs of some files) and a file fetched from
+ * a URL keeps whatever type its host sends — GitHub serves the sample clips as
+ * `application/octet-stream`, while their tiles are named `Sample 1`. The
+ * name, then the source's own path, fill the gap; a `?query` or `#hash` is not
+ * part of a file's extension.
+ */
+function mediaMime(name: string, type?: string, src?: string) {
   // `video/webm;codecs=vp9,opus` is a valid Blob type but not a valid data
   // URL media type for the <video> element or the route's MEDIA_URI check.
   // Keep only the base type.
   const base = type?.split(";", 1)[0]?.trim().toLowerCase();
   if (base && /^(audio|video)\//.test(base)) return base;
 
-  const extension = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
-  return MIME_BY_EXTENSION[extension] ?? "application/octet-stream";
+  for (const value of [name, src ?? ""]) {
+    const path = value.split(/[?#]/, 1)[0] ?? "";
+    const extension = path.includes(".") ? path.slice(path.lastIndexOf(".") + 1).toLowerCase() : "";
+    const mime = MIME_BY_EXTENSION[extension];
+    if (mime) return mime;
+  }
+  return "application/octet-stream";
 }
 
 function encodeMedia(bytes: Uint8Array, mime: string, name: string): MediaFile {
@@ -266,7 +277,7 @@ export async function mediaFromSrc(
   const mb = blob.size / (1024 * 1024);
   if (mb > maxMb) throw new Error(`That file is ${mb.toFixed(1)} MB. Keep it under ${maxMb} MB.`);
 
-  const mime = mediaMime(name, blob.type);
+  const mime = mediaMime(name, blob.type, src);
   if (!/^(audio|video)\//i.test(mime)) throw new Error("That asset is not audio or video.");
 
   const encoded = encodeMedia(new Uint8Array(await blob.arrayBuffer()), mime, name);
@@ -288,7 +299,7 @@ export async function fileFromSrc(src: string, name: string, maxMb = MAX_MEDIA_M
   const mb = blob.size / (1024 * 1024);
   if (mb > maxMb) throw new Error(`That file is ${mb.toFixed(1)} MB. Keep it under ${maxMb} MB.`);
 
-  return new File([blob], name, { type: mediaMime(name, blob.type) });
+  return new File([blob], name, { type: mediaMime(name, blob.type, src) });
 }
 
 /**

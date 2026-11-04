@@ -10,13 +10,19 @@ import {
   buildVideoRequest,
   clampDuration,
   durationOptions,
+  findExtrasFile,
   findVideoModel,
   findVideoRatio,
   findVideoResolution,
   h3TierModels,
+  isExtrasFile,
   isReferenceCaption,
   lockedByMode,
   OPENJUTSU_MODEL_ID,
+  OPENJUTSU_REFINER_LORAS,
+  REF2VA_LORA_DEFAULT,
+  REF2VA_UNET_DEFAULT,
+  REF5_UPSCALER_DEFAULT,
   placeWindow,
   ratioOptions,
   resolutionOptions,
@@ -501,4 +507,52 @@ test("a frame's caption is not mistaken for a typed prompt", () => {
   assert.equal(isReferenceCaption("Free reference"), false);
   assert.equal(isReferenceCaption("Riding a bike"), false);
   assert.equal(isReferenceCaption(""), false);
+});
+
+test("Extras are found by role, whatever name the target registered", () => {
+  // The deployment's own name is taken as it is.
+  assert.equal(findExtrasFile("ref2vaLora", REF2VA_LORA_DEFAULT, [REF2VA_LORA_DEFAULT]), REF2VA_LORA_DEFAULT);
+
+  // A desktop install registers the Pika LoRA under another spelling and
+  // precision; it is still the second pass's LoRA, and the refiner is still
+  // the refiner.
+  const desktop = [
+    "minimax_h3_open_regenerate_2k_refiner_rank_16_bf16.safetensors",
+    "Pika-H3-Flex-Ref2VA-v1-fp8.safetensors",
+  ];
+  assert.equal(findExtrasFile("ref2vaLora", REF2VA_LORA_DEFAULT, desktop), desktop[1]);
+  assert.equal(findExtrasFile("refinerLora", OPENJUTSU_REFINER_LORAS[0], desktop), desktop[0]);
+
+  // The same file under another folder counts, and its registered path is the
+  // answer the dialog saves.
+  assert.equal(
+    findExtrasFile("ref2vaUnet", REF2VA_UNET_DEFAULT, [`H3\\${REF2VA_UNET_DEFAULT}`]),
+    `H3\\${REF2VA_UNET_DEFAULT}`,
+  );
+
+  // A re-quantized upscaler matches by what it is, and the folder is not part
+  // of the name it matches on.
+  assert.equal(
+    findExtrasFile("latentUpscaler", REF5_UPSCALER_DEFAULT, ["h3_latent_upscale_model_fp16.safetensors"]),
+    "h3_latent_upscale_model_fp16.safetensors",
+  );
+  assert.equal(
+    findExtrasFile("latentUpscaler", REF5_UPSCALER_DEFAULT, ["upscalers\\minimax_h3_upscaler_3d_conv_v1.safetensors"]),
+    "upscalers\\minimax_h3_upscaler_3d_conv_v1.safetensors",
+  );
+
+  // Either refiner rank works, but the configured rank wins when both are in.
+  const ranks = [...OPENJUTSU_REFINER_LORAS].reverse();
+  assert.equal(findExtrasFile("refinerLora", OPENJUTSU_REFINER_LORAS[0], ranks), OPENJUTSU_REFINER_LORAS[0]);
+  assert.equal(
+    findExtrasFile("refinerLora", OPENJUTSU_REFINER_LORAS[0], [OPENJUTSU_REFINER_LORAS[1]]),
+    OPENJUTSU_REFINER_LORAS[1],
+  );
+
+  // Another role's file is not a match, and nothing of this role means no
+  // name rather than the nearest guess.
+  assert.equal(findExtrasFile("ref2vaLora", REF2VA_LORA_DEFAULT, [OPENJUTSU_REFINER_LORAS[0]]), undefined);
+  assert.equal(findExtrasFile("ref2vaLora", REF2VA_LORA_DEFAULT, ["unrelated.safetensors"]), undefined);
+  assert.equal(isExtrasFile("latentUpscaler", "minimax_h3_video_vae_fp16.safetensors"), false);
+  assert.equal(isExtrasFile("ref2vaUnet", `H3\\${REF2VA_UNET_DEFAULT}`), true);
 });

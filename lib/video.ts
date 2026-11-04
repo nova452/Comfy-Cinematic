@@ -471,10 +471,70 @@ export const REF2VA_LORA_DEFAULT = "pika_h3_flex_ref2va_v1_bf16.safetensors";
 /** The upscale pass's latent upscaler when Extras and `H3_LATENT_UPSCALER` leave it blank. */
 export const REF5_UPSCALER_DEFAULT = "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors";
 
-/** Whether a loader name is one of the refiner releases, in any subfolder. */
-export function isRefinerLora(name: string) {
-  const file = name.split(/[\\/]/).pop() ?? "";
-  return (OPENJUTSU_REFINER_LORAS as readonly string[]).includes(file);
+/** The gear's Extras fields, each a file Openjutsu's ref6 graph loads. */
+export type ExtrasFileKey = "ref2vaUnet" | "ref2vaLora" | "latentUpscaler" | "refinerLora";
+
+/**
+ * What makes a registered file one Extras slot's file, whatever a release
+ * calls it.
+ *
+ * The defaults are the deployment's names, but a desktop install may register
+ * the same model under another spelling, folder, rank or precision — the Pika
+ * LoRA as `Pika-H3-Flex-Ref2VA-v1-fp8.safetensors`, say, or the refiner under
+ * a rank nobody published. The role's own words are what survive a rename.
+ */
+const EXTRAS_FILE_ROLES: Record<ExtrasFileKey, (words: readonly string[]) => boolean> = {
+  ref2vaUnet: (words) => words.includes("ref2va"),
+  ref2vaLora: (words) => words.includes("pika") || words.includes("ref2va"),
+  // The latent-upscale loader lists upscale models and nothing else, so the
+  // word that names one is enough however the release spells the rest.
+  latentUpscaler: (words) => words.some((word) => word.startsWith("upscal")),
+  refinerLora: (words) => words.includes("refiner"),
+};
+
+/** A loader name's own words: its folder, case and punctuation are dropped. */
+function fileWords(name: string) {
+  const file = name.split(/[\\/]/).pop() ?? name;
+  return file.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+/** Whether a registered loader name plays one Extras slot's role. */
+export function isExtrasFile(key: ExtrasFileKey, name: string) {
+  return EXTRAS_FILE_ROLES[key](fileWords(name));
+}
+
+/**
+ * The name a target registers for one Extras file.
+ *
+ * The gear's own name wins when the target lists it. Otherwise the same file
+ * in another folder counts, then the file whose name carries the role's words:
+ * a renamed or re-quantized release still verifies. The answer is the name the
+ * target registered, so Verify can save that rather than send a guess. Among
+ * role matches the one sharing the most words with the gear's name wins, so
+ * `rank_16` still picks rank 16 when both ranks are installed.
+ */
+export function findExtrasFile(key: ExtrasFileKey, wanted: string, options: readonly string[]) {
+  const name = wanted.trim();
+  if (!name) return options.find((option) => isExtrasFile(key, option));
+  if (options.includes(name)) return name;
+
+  const wantedWords = fileWords(name);
+  const bare = wantedWords.join(" ");
+  const sameName = options.find((option) => fileWords(option).join(" ") === bare);
+  if (sameName) return sameName;
+
+  let best: string | undefined;
+  let bestScore = 0;
+  for (const option of options) {
+    const words = fileWords(option);
+    if (!EXTRAS_FILE_ROLES[key](words)) continue;
+    const score = words.filter((word) => wantedWords.includes(word)).length;
+    if (score > bestScore) {
+      best = option;
+      bestScore = score;
+    }
+  }
+  return best;
 }
 
 /** What a fresh Openjutsu install starts from: Light, no upscale, Gemini. */
