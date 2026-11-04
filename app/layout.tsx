@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import localFont from "next/font/local";
+import { ClientShims } from "../components/client-shims";
+import { GiftHost } from "../components/gift-host";
 import "./globals.css";
 
 /**
@@ -46,7 +48,11 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
     // not patch. Silencing it here only covers this element's own attributes;
     // real mismatches inside the tree still surface.
     <html lang="en" className={`${display.variable} ${ui.variable}`} suppressHydrationWarning>
-      <body>{children}</body>
+      <body>
+        <ClientShims />
+        {children}
+        <GiftHost />
+      </body>
     </html>
   );
 }

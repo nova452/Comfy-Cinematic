@@ -16,6 +16,10 @@
   --ghost: rgba(255, 255, 255, 0.08);
   --ghost-hover: rgba(255, 255, 255, 0.14);
   --danger: #ff7a8a;
+  /* Continue's warm pass and a friend's gift. */
+  --gift: #ff6b3d;
+  --gift-hover: #ff8358;
+  --gift-ink: #2b1206;
 
   --display: var(--font-display), "Arial Narrow", "Haettenschweiler", Impact, sans-serif;
   --sans: var(--font-ui), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -2172,6 +2176,11 @@ code {
   background: none;
   box-shadow: inset 0 0 0 1px var(--line-soft);
   color: var(--faint);
+  /* Eases into its locked look, as when a gift arrives and pins its settings. */
+  transition:
+    background-color 0.3s ease,
+    box-shadow 0.3s ease,
+    color 0.3s ease;
 }
 
 .chip.is-picker.is-locked svg {
@@ -4688,4 +4697,386 @@ button.panel-row:hover:not(:disabled) {
   font-family: var(--mono);
   font-size: 12px;
   line-height: 1.6;
+}
+
+/* --------------------------------- gifting -------------------------------- */
+
+.gift-button[data-on="true"] {
+  color: var(--lime);
+}
+
+.modal.gift-panel {
+  width: min(460px, calc(100vw - 32px));
+}
+
+.gift-lede,
+.gift-state,
+.gift-note {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.gift-state,
+.gift-note {
+  margin: 12px 0 0;
+  color: var(--faint);
+  font-size: 12px;
+}
+
+.gift-create {
+  width: 100%;
+  border-color: var(--lime);
+  background: transparent;
+  color: var(--lime);
+}
+
+.gift-create:hover:not(:disabled) {
+  background: rgba(242, 255, 89, 0.12);
+}
+
+.gift-fresh {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.gift-fresh input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--plum-deep);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.gift-error {
+  margin: 10px 0 0;
+  color: var(--danger);
+  font-size: 12.5px;
+}
+
+.gift-links {
+  display: grid;
+  gap: 6px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.gift-links li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: var(--plum-deep);
+  font-size: 12.5px;
+}
+
+.gift-links li > span:first-child {
+  flex: 1;
+}
+
+/* Why a link's last try failed, for the gifter only. */
+.gift-why {
+  flex-basis: 100%;
+  order: 3;
+  color: var(--faint);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gift-when {
+  display: flex;
+  gap: 8px;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+.gift-when a {
+  color: var(--lime);
+}
+
+.gift-links button {
+  padding: 5px 10px;
+  font-size: 10px;
+}
+
+.gift-toast {
+  position: fixed;
+  bottom: 22px;
+  left: 50%;
+  z-index: 70;
+  max-width: min(460px, calc(100vw - 32px));
+  padding: 10px 16px;
+  border: 1px solid rgba(242, 255, 89, 0.4);
+  border-radius: 14px;
+  background: rgba(42, 33, 50, 0.96);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+  color: var(--ink);
+  font-size: 13px;
+  transform: translateX(-50%);
+}
+
+.gift-toast-actions {
+  display: inline-flex;
+  gap: 6px;
+  margin-left: 10px;
+  vertical-align: middle;
+}
+
+.gift-toast-actions button {
+  padding: 4px 10px;
+  font-size: 10px;
+}
+
+.gift-toast[data-tone="error"] {
+  border-color: var(--danger);
+}
+
+/* A gift wears Continue's warm orange, so it never reads as the studio's own lime. */
+.free-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--gift);
+  color: var(--gift-ink);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1.5;
+}
+
+/*
+ * The moment a gift arrives: a warm light sweeps once across the model row,
+ * FREE 1 pops in as it passes, and the sparks follow 1.2s after it lands.
+ * When the gift is gone, FREE 1 folds away. Each plays once, on the change.
+ */
+.panel-row.is-gift-arriving {
+  position: relative;
+}
+
+.panel-row.is-gift-arriving::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+      100deg,
+      rgba(255, 107, 61, 0) 40%,
+      rgba(255, 107, 61, 0.12) 46%,
+      rgba(255, 150, 112, 0.2) 50%,
+      rgba(255, 107, 61, 0.12) 54%,
+      rgba(255, 107, 61, 0) 60%
+    )
+    no-repeat;
+  /* Wider than the row, so the band starts and ends out of sight. */
+  background-size: 250% 100%;
+  pointer-events: none;
+  animation: gift-sheen 0.9s cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+
+@keyframes gift-sheen {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0% 0;
+  }
+}
+
+.free-badge.is-arriving {
+  animation:
+    gift-badge-in 0.5s cubic-bezier(0.2, 0.9, 0.3, 1.15) 0.22s both,
+    gift-badge-glow 0.9s ease-out 0.3s both;
+}
+
+@keyframes gift-badge-in {
+  from {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* One ring of warm light that spreads from the badge and fades. */
+@keyframes gift-badge-glow {
+  from {
+    box-shadow: 0 0 0 0 rgba(255, 107, 61, 0.5);
+  }
+  to {
+    box-shadow: 0 0 0 10px rgba(255, 107, 61, 0);
+  }
+}
+
+.free-badge.is-leaving {
+  animation: gift-badge-out 0.24s ease-in both;
+}
+
+@keyframes gift-badge-out {
+  to {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel-row.is-gift-arriving::after {
+    display: none;
+  }
+
+  .free-badge.is-arriving,
+  .free-badge.is-leaving {
+    animation: none;
+  }
+}
+
+/*
+ * A gift's hint (GiftTrail in project-workspace.tsx): a spark runs once around
+ * the empty character slot and the empty clip row, then they rest thirty
+ * seconds before the next. Both run on one clock, on the line the yellow focus
+ * ring takes, 2px outside the dashed border, so each input keeps its own look.
+ *
+ * The head and the end of the tail run the same lap, the end 0.3s behind, so
+ * the tail is as long as the ground the head has just covered: the spark
+ * lights as a dot, stretches out while it runs, and draws back into its head
+ * as it lands where it started.
+ */
+@property --gift-trail {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
+}
+
+@property --gift-from {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
+}
+
+.reference-add.has-spark,
+.media-drop.has-spark {
+  position: relative;
+}
+
+.gift-trail {
+  /* Shares of the outline: how much of the covered ground the tail shows, and the head's length. */
+  --trail-scale: 1;
+  --trail-core: 5;
+  position: absolute;
+  /* The focus ring's line: a 2px outline drawn 2px out from the input's edge. */
+  inset: -5px;
+  width: calc(100% + 10px);
+  height: calc(100% + 10px);
+  overflow: visible;
+  pointer-events: none;
+  opacity: 0;
+  animation: gift-trail 32s linear 1.2s infinite;
+}
+
+/* The clip row's outline is about seven times the slot's: smaller shares keep its spark in proportion. */
+.media-drop .gift-trail {
+  --trail-scale: 0.5;
+  --trail-core: 1;
+}
+
+.gift-trail rect {
+  --tail: calc((var(--gift-trail) - var(--gift-from)) * var(--trail-scale));
+  x: 1px;
+  y: 1px;
+  width: calc(100% - 2px);
+  height: calc(100% - 2px);
+  rx: 15px;
+  fill: none;
+  stroke-linecap: round;
+  /* Each layer is one dash, from its length behind the head up to the head. */
+  stroke-dasharray: var(--length) calc(100 - var(--length));
+  stroke-dashoffset: calc(var(--length) - var(--gift-trail));
+}
+
+/* Thinner as well as fainter toward the end of the tail. */
+.gift-trail-tail {
+  --length: calc(var(--tail) * var(--part));
+  stroke: rgba(255, 107, 61, 0.15);
+  stroke-width: calc(2.2px - var(--part) * 0.8px);
+}
+
+.gift-trail-core {
+  --length: min(var(--trail-core), var(--tail));
+  stroke: rgba(255, 150, 112, 0.4);
+  stroke-width: 2px;
+}
+
+/* A soft halo around the head. */
+.gift-trail-glow {
+  --length: min(calc(var(--trail-core) * 3), var(--tail));
+  stroke: rgba(255, 107, 61, 0.16);
+  stroke-width: 6px;
+  filter: blur(2.5px);
+}
+
+/* Hidden, not stopped: a hovered spark keeps the shared clock. */
+.has-spark:hover .gift-trail {
+  visibility: hidden;
+}
+
+/*
+ * One lap in about one and a half seconds of 32, easing in and out, then
+ * thirty seconds of rest. In seconds: lit by 0.21, the head lands at 1.54,
+ * the end of the tail runs the same lap 0.3 behind and lands at 1.84, and the
+ * last of the light is gone at 1.89.
+ */
+@keyframes gift-trail {
+  0% {
+    --gift-trail: 0;
+    --gift-from: 0;
+    opacity: 0;
+    animation-timing-function: cubic-bezier(0.45, 0, 0.35, 1);
+  }
+  0.656% {
+    opacity: 0.85;
+  }
+  0.9375% {
+    --gift-from: 0;
+    animation-timing-function: cubic-bezier(0.45, 0, 0.35, 1);
+  }
+  4.8125% {
+    --gift-trail: 100;
+  }
+  5.25% {
+    opacity: 0.85;
+  }
+  5.75% {
+    --gift-from: 100;
+  }
+  5.906% {
+    opacity: 0;
+  }
+  100% {
+    --gift-trail: 100;
+    --gift-from: 100;
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gift-trail {
+    display: none;
+  }
 }

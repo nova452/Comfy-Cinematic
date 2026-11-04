@@ -1,9 +1,22 @@
 "use client";
 
 import Link from "next/link";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { AccountMenu } from "./account-menu";
+import { FIX_OPENJUTSU, GiftButton } from "./gift-host";
+import { GIFT_LIMITS } from "../lib/gift";
+import {
+  collectGiftVideo,
+  giftJob,
+  giftLinkState,
+  HOST_OFF_MESSAGE,
+  readProjectGift,
+  submitGift,
+  writeProjectGift,
+  type GiftJobView,
+  type ProjectGift,
+} from "../lib/gift-client";
 import { ChipPicker } from "./chip-picker";
 import { ModelLogo } from "./model-logo";
 import { AssetPicker, type PickedAsset } from "./asset-picker";
@@ -97,7 +110,7 @@ import {
   type VideoResolution,
 } from "../lib/video";
 import type { StudioPlan } from "../lib/studio";
-import { CANCELLED_MESSAGE, isSamplerProgress } from "../lib/render-progress";
+import { CANCELLED_MESSAGE, isSamplerProgress, progressLabel } from "../lib/render-progress";
 import { formatTimingSummary, readTiming } from "../lib/render-timing";
 import {
   MAX_FRAMES,
@@ -229,6 +242,8 @@ type PendingRender = {
   aspect?: number;
   /** The request this slot waits on, when it is not the slot's own id (a still batch shares one). */
   renderId?: string;
+  /** A friend's gift, rendering on the gifter's machine. */
+  gift?: boolean;
 };
 
 /** What `/api/video/progress` says about one clip in flight. */
@@ -679,6 +694,33 @@ function CanvasTools({
   );
 }
 
+/** How far back each layer of a spark's tail reaches, as a share of the tail. */
+const TRAIL_PARTS = [1, 0.74, 0.5, 0.3, 0.14];
+
+/**
+ * A gift's hint: a spark that runs once around an empty input, on the line its
+ * focus ring takes, then rests (globals.css times it). Every layer is a dash of
+ * one rounded outline that ends at the same head, so the light is brightest
+ * where they all overlap and thins out down the tail, at one speed all the way
+ * round.
+ */
+function GiftTrail() {
+  return (
+    <svg className="gift-trail" aria-hidden="true">
+      <rect className="gift-trail-glow" pathLength={100} />
+      {TRAIL_PARTS.map((part) => (
+        <rect
+          key={part}
+          className="gift-trail-tail"
+          pathLength={100}
+          style={{ "--part": part } as React.CSSProperties}
+        />
+      ))}
+      <rect className="gift-trail-core" pathLength={100} />
+    </svg>
+  );
+}
+
 type ReferenceSlotProps = {
   kind: "character" | "background" | "reference";
   value?: Reference;
@@ -693,6 +735,8 @@ type ReferenceSlotProps = {
   onTag?: () => void;
   /** What a click on the filled slot does, for its tooltip. */
   tagTitle?: string;
+  /** A gift's hint: a spark that runs around the empty slot now and then. */
+  spark?: boolean;
 };
 
 const REFERENCE_GLYPH: Record<ReferenceSlotProps["kind"], React.ReactNode> = {
@@ -725,7 +769,7 @@ const REFERENCE_TITLE: Record<ReferenceSlotProps["kind"], string> = {
 };
 
 /** One upload slot: empty shows a dashed tile, filled shows the image. */
-function ReferenceSlot({ kind, value, disabled, onChange, onPick, onTag, tagTitle }: ReferenceSlotProps) {
+function ReferenceSlot({ kind, value, disabled, onChange, onPick, onTag, tagTitle, spark }: ReferenceSlotProps) {
   const noun = REFERENCE_TITLE[kind];
   const title = kind === "reference" ? "Add a reference image" : `Add a ${noun} reference`;
   const removeTitle = kind === "reference" ? "Remove reference image" : `Remove ${noun} reference`;
@@ -786,12 +830,13 @@ function ReferenceSlot({ kind, value, disabled, onChange, onPick, onTag, tagTitl
   return (
     <button
       type="button"
-      className="reference-add"
+      className={`reference-add${spark ? " has-spark" : ""}`}
       title={title}
       data-kind={kind}
       disabled={disabled}
       onClick={onPick}
     >
+      {spark && <GiftTrail />}
       {REFERENCE_GLYPH[kind]}
       <span className="sr-only">{title}</span>
     </button>
@@ -799,6 +844,8 @@ function ReferenceSlot({ kind, value, disabled, onChange, onPick, onTag, tagTitl
 }
 
 type MediaSlotProps = {
+  /** A gift's hint: a spark that runs around the empty slot now and then. */
+  spark?: boolean;
   tag: string;
   /** Shown in place of the filename while the slot is empty. */
   label: string;
@@ -830,6 +877,7 @@ type MediaSlotProps = {
  * sibling rather than nested markup — a button inside a button is not a thing.
  */
 function MediaSlot({
+  spark,
   tag,
   label,
   noun,
@@ -850,7 +898,7 @@ function MediaSlot({
     <div className="media-slot">
       <button
         type="button"
-        className={`media-drop${compact ? " compact" : ""}${value ? " is-filled" : ""}${preview ? " has-preview" : ""}`}
+        className={`media-drop${compact ? " compact" : ""}${value ? " is-filled" : ""}${preview ? " has-preview" : ""}${spark ? " has-spark" : ""}`}
         title={
           value
             ? `${value.name} · ${value.mb.toFixed(1)} MB${viewable ? " · click to view" : ""}`
@@ -881,6 +929,7 @@ function MediaSlot({
             )}
           </span>
         )}
+        {spark && <GiftTrail />}
         <span className="media-tag">{tag}</span>
         <span className="media-name">{value ? value.name : label}</span>
         {hint ? <span className="media-size">{hint}</span> : null}
@@ -1077,6 +1126,43 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
   const [tracks, setTracks] = useState<Record<string, RenderTrack>>({});
   /** False once the workspace unmounts, while its renders keep running. */
   const mountedRef = useRef(true);
+  /**
+   * The gift link this project was opened from, if any. While it is unspent
+   * the Video tab is pinned to the gift's settings and Generate sends the
+   * request to the gifter's relay instead of this browser's own account.
+   */
+  const [gift, setGift] = useState<ProjectGift>();
+  const giftRef = useRef<ProjectGift | undefined>(undefined);
+  const followingGift = useRef<string | undefined>(undefined);
+  /**
+   * The relay has vouched for the gift on this visit. Until it has, a gift
+   * project looks and works like any other; it is checked again on every visit
+   * rather than trusted from the last one.
+   */
+  const [giftValid, setGiftValid] = useState(false);
+  /** A gift vouched for on this visit and not spent. */
+  const giftLive = Boolean(gift && giftValid && !gift.spent);
+  /**
+   * The gift is for Openjutsu Prime, so it is on only while that model is
+   * picked: FREE 1, the sparks, its size and length, and Generate sending to
+   * the gifter. Any other model renders as in any other project.
+   */
+  const giftOn = giftLive && videoModel === OPENJUTSU_MODEL_ID;
+  /**
+   * The moment the gift comes on or goes off, for the panel's transitions
+   * (globals.css). It is set before the browser paints, so FREE 1 never shows
+   * a frame in full ahead of its animation, and it clears once they have
+   * played, so coming back to the Video tab later does not play them again.
+   */
+  const [giftMoment, setGiftMoment] = useState<"arriving" | "leaving">();
+  const giftWasOn = useRef(giftOn);
+  useLayoutEffect(() => {
+    if (giftWasOn.current === giftOn) return;
+    giftWasOn.current = giftOn;
+    setGiftMoment(giftOn ? "arriving" : "leaving");
+    const timer = window.setTimeout(() => setGiftMoment(undefined), giftOn ? 1200 : 260);
+    return () => window.clearTimeout(timer);
+  }, [giftOn]);
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -1289,6 +1375,78 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     for (const still of orphanStills) void resumeStill(still);
     // resumeClip reads only refs and setters, so the project id is the only trigger.
   }, [projectId]);
+
+  // A gift this browser rendered failed on a model file the target lacks
+  // (gift-host.tsx): Openjutsu's settings open with the target's real file
+  // lists fetched, as after one of this project's own renders. Re-subscribed
+  // each render so it reads the current settings.
+  useEffect(() => {
+    const fix = (event: Event) => {
+      event.preventDefault();
+      setTab("video");
+      openLocalConfig("openjutsu");
+      const saved = openjutsuConfig ?? localConfig;
+      void verifyLocalConfig({
+        unet: saved?.unet ?? LOCAL_MODEL_DEFAULTS.unet,
+        clip: saved?.clip ?? LOCAL_MODEL_DEFAULTS.clip,
+        target: "openjutsu",
+      });
+    };
+    window.addEventListener(FIX_OPENJUTSU, fix);
+    return () => window.removeEventListener(FIX_OPENJUTSU, fix);
+  });
+
+  // A gift project picks its request back up after a reload or a visit away.
+  useEffect(() => {
+    const saved = readProjectGift(projectId);
+    giftRef.current = saved;
+    setGift(saved);
+    // A request already with the gifter was vouched for when it was taken.
+    setGiftValid(Boolean(saved?.jobId && !saved.spent));
+    // The link is checked with the gifter's relay while the project is open,
+    // on every visit until its clip is asked for. Confirmed, the gift shows
+    // (FREE 1); refused (made up, expired, revoked, used), the panel says why
+    // and the project stays a plain one. A relay that does not answer leaves
+    // it plain for now: Generate asks again and says if the host is off.
+    if (saved && !saved.spent && !saved.jobId) {
+      void giftLinkState(saved).then((link) => {
+        const current = giftRef.current;
+        if (!current || current.token !== saved.token || current.jobId || current.spent) return;
+        if (link.state === "off") return;
+        if (link.state === "active") {
+          if (!current.confirmed) storeGift({ ...current, confirmed: true });
+          setGiftValid(true);
+          return;
+        }
+        storeGift({ ...current, spent: true });
+        // A comment, not an error: the visitor did nothing wrong.
+        setFailed(false);
+        setStatus(link.state === "used" ? "This gift link has already been used." : link.error);
+      });
+    }
+    if (!saved?.jobId || !saved.slot || saved.spent) return;
+    const slot = saved.slot;
+    setPending((list) =>
+      list.some((item) => item.id === slot.id) ? list : [...list, { ...slot, kind: "video", gift: true }],
+    );
+    void followGift(saved);
+    // followGift reads only refs and setters, so the project id is the only trigger.
+  }, [projectId]);
+
+  // A gift's two sparks (GiftTrail) run on one clock. CSS starts each when its
+  // input shows it, and the clip row shows its spark a moment later, so every
+  // spark is moved onto the earliest one's start.
+  const sparkInputs = `${giftOn && characters.length === 0}:${giftOn && videoMode === "video" && !clipRef}`;
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      const sparks = document
+        .getAnimations()
+        .filter((animation) => animation instanceof CSSAnimation && animation.animationName === "gift-trail");
+      const start = Math.min(...sparks.map((animation) => Number(animation.startTime ?? Infinity)));
+      if (Number.isFinite(start)) for (const animation of sparks) animation.startTime = start;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [sparkInputs]);
 
   /**
    * Apply a finished render to the project, and store it before returning.
@@ -1504,6 +1662,14 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       continuePrior.current = null;
     }
   }, [videoModel]);
+
+  // While the gift is on, the chips show what it renders: its own size and
+  // length, whatever a model change or a clip's trim window would set.
+  useEffect(() => {
+    if (!giftOn) return;
+    if (videoResolution !== GIFT_LIMITS.resolution) setVideoResolution(GIFT_LIMITS.resolution);
+    if (videoDuration !== GIFT_LIMITS.duration) setVideoDuration(GIFT_LIMITS.duration);
+  }, [giftOn, videoResolution, videoDuration]);
 
   useEffect(() => {
     const model = findImageTool(imageModel) ?? DEFAULT_TOOL;
@@ -2456,6 +2622,152 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     return videoRatioForSize(clipRef.width, clipRef.height) ?? videoRatio;
   }
 
+  /** Keep the gift in state, in its ref and in the browser, as one. */
+  function storeGift(next: ProjectGift | undefined) {
+    giftRef.current = next;
+    writeProjectGift(projectId, next);
+    if (mountedRef.current) setGift(next);
+  }
+
+  /**
+   * Spend the gift: hand the clip, cast and words to the gifter's relay. An
+   * absent host costs nothing; the link stays as it was for another try.
+   */
+  async function sendGift(current: ProjectGift, value: string) {
+    if (!project || !clipRef || !ref5 || current.jobId) return;
+    setBusy(true);
+    setFailed(false);
+    setNotice(undefined);
+    setStatus(undefined);
+    // The tile comes up as Generate is pressed, as for any render, while the
+    // request is still on its way to the gifter.
+    const position = nextPosition([...project.frames, ...pending]);
+    const slot = {
+      id: crypto.randomUUID(),
+      x: position.x,
+      y: position.y,
+      prompt: value,
+      aspect: ratioValue(clipRenderRatio()),
+    };
+    setPending((list) => [...list, { ...slot, kind: "video", gift: true }]);
+    try {
+      const job = await submitGift(current, {
+        prompt: value,
+        auto: ref5Auto,
+        characters: characters.map((item) => item.base64),
+        video: clipRef.dataUrl,
+        ...(clipStart > 0 ? { start: clipStart } : {}),
+      });
+      const meta: ClipMeta = {
+        value,
+        mode: "video",
+        model: GIFT_LIMITS.model,
+        ratio: clipRenderRatio(),
+        resolution: GIFT_LIMITS.resolution,
+        duration: GIFT_LIMITS.duration,
+        brain: null,
+        ...(clipAssetId ? { clip: clipAssetId } : {}),
+        ...(clipStart > 0 ? { start: clipStart } : {}),
+        characterSrcs: await Promise.all(characters.map((item) => putJpeg(item.base64))),
+      };
+      const next: ProjectGift = { ...current, jobId: job.id, slot, meta, startedAt: Date.now() };
+      storeGift(next);
+      void followGift(next, job);
+    } catch (cause) {
+      setPending((list) => list.filter((item) => item.id !== slot.id));
+      setFailed(true);
+      setStatus(cause instanceof Error ? cause.message : "The gift could not be sent.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /**
+   * Follow a gift request until its clip lands on the canvas. The relay may
+   * drop out for a moment (the tunnel, the gifter's network), so a missed
+   * poll only waits; the request is the gifter's to finish or fail.
+   */
+  async function followGift(current: ProjectGift, first?: GiftJobView) {
+    const jobId = current.jobId;
+    const slot = current.slot;
+    if (!jobId || !slot || followingGift.current === jobId) return;
+    followingGift.current = jobId;
+    // The tile reads as if the clip were rendering here: the gifter's own
+    // stage, steps and clock once their render runs, the plain "Rendering
+    // clip…" until then, and "Finishing…" while the clip comes back.
+    let track: RenderTrack | undefined;
+    const show = (job: GiftJobView) => {
+      if (job.track) track = job.track;
+      else if (track && (job.status === "uploading" || job.status === "done")) {
+        track = { label: progressLabel({ stage: "done" }), stage: "done", elapsed: track.elapsed };
+      }
+      if (track) setTracks((tracks) => ({ ...tracks, [slot.id]: track! }));
+    };
+    const drop = () => setPending((list) => list.filter((item) => item.id !== slot.id));
+
+    let job: GiftJobView | undefined = first;
+    try {
+      while (mountedRef.current && giftRef.current?.jobId === jobId) {
+        if (job) {
+          show(job);
+          if (job.status === "done") break;
+          if (job.status === "failed") {
+            drop();
+            // A failed render gives the link back while it has tries left.
+            const link = await giftLinkState(current);
+            const again = link.state === "active";
+            storeGift(
+              again ? { token: current.token, host: current.host, confirmed: true } : { ...current, spent: true },
+            );
+            setFailed(true);
+            setStatus(
+              `${job.error ?? "The gift could not be rendered."}${again ? " The gift is still yours: try again." : ""}`,
+            );
+            return;
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        const answer = await giftJob(current, jobId);
+        if (answer && "gone" in answer) {
+          drop();
+          storeGift({ ...current, spent: true });
+          setFailed(true);
+          setStatus(answer.gone);
+          return;
+        }
+        job = answer;
+      }
+      if (!mountedRef.current || job?.status !== "done") return;
+
+      show({ ...job, status: "done" });
+      const src = await collectGiftVideo(current, job);
+      if (!src) {
+        drop();
+        storeGift({ ...current, spent: true });
+        setFailed(true);
+        setStatus(
+          job.videoUrl
+            ? `Your clip is ready, but this page could not download it. Save it from ${job.videoUrl} within 24 hours.`
+            : "Your clip was rendered, but it could not be delivered.",
+        );
+        return;
+      }
+      const placed = pendingRef.current.find((item) => item.id === slot.id) ?? slot;
+      const frame = await clipFrame(slot.id, { src }, current.meta as ClipMeta, placed);
+      await applyProjectUpdate((project) => ({
+        ...project,
+        frames: [...project.frames, frame].slice(0, MAX_FRAMES),
+        updatedAt: Date.now(),
+      }));
+      storeGift({ token: current.token, host: current.host, confirmed: true, spent: true });
+      drop();
+      setSelected(frame.id);
+      setNotice("Your gift clip is here.");
+    } finally {
+      if (followingGift.current === jobId) followingGift.current = undefined;
+    }
+  }
+
   async function sendVideo() {
     // With the ref5 prompt off, whatever is in the box stays there unsent.
     const value = ref5Auto ? "" : videoPrompt.replace(/\s+/g, " ").trim();
@@ -2483,6 +2795,30 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
     if (characters.length > maxCharacters) {
       setFailed(true);
       setStatus(`${activeVideoModel.label} takes at most ${maxCharacters} characters here. Remove some.`);
+      return;
+    }
+    if (gift && !gift.spent && videoModel === OPENJUTSU_MODEL_ID) {
+      let current = gift;
+      // A gift whose relay did not answer when the project opened is asked
+      // again now; only now does the visitor hear that the host is off.
+      if (!giftValid) {
+        const link = await giftLinkState(current);
+        if (link.state === "off") {
+          setFailed(true);
+          setStatus(HOST_OFF_MESSAGE);
+          return;
+        }
+        if (link.state !== "active") {
+          storeGift({ ...current, spent: true });
+          setFailed(false);
+          setStatus(link.state === "used" ? "This gift link has already been used." : link.error);
+          return;
+        }
+        current = { ...current, confirmed: true };
+        storeGift(current);
+        setGiftValid(true);
+      }
+      await sendGift(current, value);
       return;
     }
 
@@ -2717,6 +3053,8 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
    * restarted — answers 404, so the tile and its saved record go right here.
    */
   async function cancelPending(slot: PendingRender) {
+    // A gift runs on the gifter's machine; this page has nothing to stop.
+    if (slot.gift) return;
     const renderId = slot.renderId ?? slot.id;
     let known = false;
     try {
@@ -3242,6 +3580,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
       {characters.length < maxCharacters && (
         <ReferenceSlot
           kind="character"
+          spark={giftOn && characters.length === 0}
           onChange={(next) => {
             if (!next) return;
             setNotice(undefined);
@@ -3880,6 +4219,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
         <span className="save-dot" data-state={saveState} title={saveState === "error" ? "Not saved" : "Saved"}>
           {saveState === "saving" ? "saving" : saveState === "error" ? "unsaved" : savedAt ? "saved" : ""}
         </span>
+        <GiftButton />
         <button
           type="button"
           className="share"
@@ -4119,7 +4459,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
           <div className="panel-body">
             <button
               type="button"
-              className="panel-row"
+              className={`panel-row${giftMoment === "arriving" ? " is-gift-arriving" : ""}`}
               onClick={() => setVideoModelOpen(true)}
               aria-haspopup="dialog"
             >
@@ -4133,6 +4473,9 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 <span className="model-label">
                   {activeVideoModel.label}
                   <ModelLogo brand="minimax" />
+                  {(giftOn || giftMoment === "leaving") && (
+                    <span className={`free-badge${giftMoment ? ` is-${giftMoment}` : ""}`}>FREE 1</span>
+                  )}
                 </span>
               </span>
               <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2.2" aria-hidden="true">
@@ -4251,6 +4594,7 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
             ) : (
               <div className="media-row">
                 <MediaSlot
+                  spark={giftOn && videoMode === "video" && !mediaRef}
                   tag={videoMode === "audio" ? "Aud" : "Vid"}
                   label={videoMode === "audio" ? "Add an audio reference" : "Add a video reference"}
                   noun={videoMode === "audio" ? "audio reference" : "video reference"}
@@ -4358,11 +4702,13 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 title={`Clip length · ${activeVideoModel.minDuration}–${activeVideoModel.maxDuration}s`}
                 label={`${videoDuration}s`}
                 value={String(videoDuration)}
-                locked={modeLocks.duration && !continuation}
+                locked={giftOn || (modeLocks.duration && !continuation)}
                 lockedHint={
-                  videoMode === "audio"
-                    ? "Set by the audio reference. Edit its trim window"
-                    : "Set by the reference clip. Edit its trim window"
+                  giftOn
+                    ? "Set by the gift"
+                    : videoMode === "audio"
+                      ? "Set by the audio reference. Edit its trim window"
+                      : "Set by the reference clip. Edit its trim window"
                 }
                 items={durationOptions(activeVideoModel).map((seconds) => ({
                   id: String(seconds),
@@ -4375,6 +4721,8 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
                 title="Resolution"
                 label={videoResolutionLabel(videoResolution)}
                 value={videoResolution}
+                locked={giftOn}
+                lockedHint="Set by the gift"
                 items={resolutionOptions(activeVideoModel).map((option) => ({
                   id: option.id,
                   label: option.label,
@@ -4398,7 +4746,10 @@ export function ProjectWorkspace({ projectId }: { projectId: string }) {
               className="generate"
               onClick={() => void sendVideo()}
               disabled={
-                busy || Boolean(ref5Missing) || ((videoMode === "free" || (ref5 && !ref5Auto)) && !videoPrompt.trim())
+                busy ||
+                Boolean(gift?.jobId && !gift.spent && videoModel === OPENJUTSU_MODEL_ID) ||
+                Boolean(ref5Missing) ||
+                ((videoMode === "free" || (ref5 && !ref5Auto)) && !videoPrompt.trim())
               }
               title={ref5Missing}
             >

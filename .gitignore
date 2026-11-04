@@ -16,3 +16,6 @@ Resources
 # Written by next dev for coding agents
 AGENTS.md
 CLAUDE.md
+
+# Local agent config
+.claude/
